@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl-version:
+          - '5.20'
+          - '5.26'
+          - '5.30'
+          - '5.34'
+          - '5.38'
+          - '5.40'
+          - '5.42'
+    container:
+      image: perldocker/perl-tester:${{ matrix.perl-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: perl -V
+      - run: perl Makefile.PL
+      - run: make
+      - run: make test
+
+  alpine:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    steps:
+      - name: Install dependencies
+        run: apk add --no-cache git perl perl-dev make gcc musl-dev
+      - uses: actions/checkout@v4
+      - run: perl -V
+      - run: perl Makefile.PL
+      - run: make
+      - run: make test
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl-version:
+          - '5.26'
+          - '5.34'
+          - '5.40'
+          - '5.42'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl-version }}
+      - run: perl -V
+      - run: perl Makefile.PL
+      - run: make
+      - run: make test
+
+  asan:
+    runs-on: ubuntu-latest
+    container:
+      image: perldocker/perl-tester:5.40
+    steps:
+      - uses: actions/checkout@v4
+      - run: perl Makefile.PL OPTIMIZE="-O1 -g -fsanitize=address -fno-omit-frame-pointer"
+      - run: make OTHERLDFLAGS="-fsanitize=address"
+      - name: make test (ASAN)
+        run: |
+          ASAN_LIB=$(cc -print-file-name=libasan.so)
+          LD_PRELOAD="$ASAN_LIB" ASAN_OPTIONS=detect_leaks=0 make test
+
+  valgrind:
+    runs-on: ubuntu-latest
+    container:
+      image: perldocker/perl-tester:5.40
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update -q && apt-get install -y -q valgrind
+      - run: perl Makefile.PL OPTIMIZE="-O0 -g"
+      - run: make
+      - name: make test (valgrind)
+        run: |
+          valgrind --leak-check=full --show-leak-kinds=definite --errors-for-leak-kinds=definite \
+            --log-file=/tmp/vg.log \
+            perl -Iblib/lib -Iblib/arch t/fortune.t
+          grep -E '(definitely lost|ERROR SUMMARY)' /tmp/vg.log
+          LOST=$(grep 'definitely lost' /tmp/vg.log | grep -oP '\d+(?= bytes)' | head -1)
+          [ "${LOST:-0}" -eq 0 ] && echo "OK: no definite leaks" || { echo "FAIL: $LOST bytes definitely lost"; exit 1; }
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y perl5
+          run: |
+            perl -V
+            perl Makefile.PL
+            make
+            make test

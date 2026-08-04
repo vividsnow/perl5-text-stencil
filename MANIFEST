@@ -18,6 +18,7 @@ t/edge_coverage.t
 t/examples.t
 t/fortune.t
 t/generic.t
+t/readme.t
 t/regressions.t
 t/render_cb_croak.t
 t/threads.t

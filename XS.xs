@@ -50,6 +50,13 @@ static int ts_gmtime(const time_t *epoch, struct tm *out) {
 #endif
 }
 
+/* The digit-takers accept a sign anywhere in the text, not just in front. */
+PERL_STATIC_INLINE int ts_has_minus(const char *s, STRLEN len) {
+    STRLEN i;
+    for (i = 0; i < len; i++) if (s[i] == '-') return 1;
+    return 0;
+}
+
 /* Take a decimal out of text, saturating at the IV range. The magnitude is
    accumulated in a UV because IV_MIN is one larger in magnitude than IV_MAX:
    saturating an IV and negating afterwards lands one short of the most
@@ -60,10 +67,13 @@ static IV ts_scan_iv(const char *s, STRLEN len, int neg) {
     UV uv = 0;
     STRLEN i;
     for (i = 0; i < len; i++) {
+        UV d;
         if (s[i] < '0' || s[i] > '9') continue;
-        if (uv > (lim - 9) / 10) { uv = lim; break; }
-        uv = uv * 10 + (UV)(s[i] - '0');
-        if (uv > lim) { uv = lim; break; }
+        d = (UV)(s[i] - '0');
+        /* bound against the digit in hand, not a worst-case 9: that saturated
+           the top eight magnitudes although they fit */
+        if (uv > (lim - d) / 10) { uv = lim; break; }
+        uv = uv * 10 + d;
     }
     if (neg) return (uv >= lim) ? IV_MIN : -(IV)uv;
     return (uv > (UV)IV_MAX) ? IV_MAX : (IV)uv;
@@ -244,7 +254,7 @@ enum xform_type {
     XF_SPRINTF, XF_REPLACE, XF_SUBSTR, XF_PLURAL,
     XF_IF, XF_UNLESS, XF_MAP, XF_WRAP,
     XF_NUMBER_SI, XF_BYTES_SI, XF_ELAPSED, XF_AGO,
-    XF_MASK, XF_ROWNUM, XF_COALESCE, XF_LENGTH
+    XF_MASK, XF_COALESCE, XF_LENGTH
 };
 enum row_mode { ROW_ARRAY, ROW_HASH };
 
@@ -285,6 +295,9 @@ typedef struct {
     char *sep;      STRLEN sep_len;
     tpl_op *ops;    int nops;
     enum row_mode mode;
+    /* the template really contained a numeric {0} ref, as opposed to mode
+       defaulting to ROW_ARRAY because it contained no field refs at all */
+    int saw_num_ref;
     SSize_t last_row_count;
     char escape_char;   /* delimiter char, default '{' */
     char *render_buf;   STRLEN render_buf_alloc;
@@ -322,8 +335,18 @@ static void tpl_free(tpl_compiled *t);
    vtable is all-zero -- we free in DESTROY, not from magic. */
 static MGVTBL ts_vtbl = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
+/* Only a PVMG or richer body has a magic chain; mg_findext does not check, so
+   on anything smaller it walks whatever the union holds instead. A blessed
+   referent is always upgraded by sv_bless, which is why every method call is
+   safe -- but the function-call form, Text::Stencil::render(\"str", ...),
+   hands us an unblessed low-type referent and segfaulted once the heap was
+   warm enough for the garbage to be non-NULL. */
+#define TS_HAS_OUR_MAGIC(sv) \
+    (SvROK(sv) && SvTYPE(SvRV(sv)) >= SVt_PVMG \
+     ? mg_findext(SvRV(sv), PERL_MAGIC_ext, &ts_vtbl) : NULL)
+
 static tpl_compiled *ts_self(pTHX_ SV *sv) {
-    MAGIC *mg = SvROK(sv) ? mg_findext(SvRV(sv), PERL_MAGIC_ext, &ts_vtbl) : NULL;
+    MAGIC *mg = TS_HAS_OUR_MAGIC(sv);
     tpl_compiled *t = mg ? (tpl_compiled *)mg->mg_ptr : NULL;
     /* the owner test rejects a copy that carried the magic along with it */
     if (!t || t->owner != SvRV(sv))
@@ -371,7 +394,21 @@ static tpl_compiled *ts_pin_self(pTHX_ SV *sv) {
 /* DBL_MAX at 30 decimals is 341 bytes; sizing short truncated it into a
    different number */
 #define TS_FLTSZ 384
-/* __attribute__ format so the compiler checks these 16 call sites too */
+
+/* Scratch for handing a field to strtod. At 64 it truncated a longer numeric
+   to 63 digits -- a wrong magnitude, not a rounding nit. A double overflows
+   past ~1.8e308, so 309 integer digits covers everything it can represent.
+   Stack only: no cost on the sort comparator, which runs this per compare. */
+#define TS_NUMBUF 512
+
+PERL_STATIC_INLINE double ts_atof(const char *s, STRLEN len) {
+    char b[TS_NUMBUF];
+    STRLEN n = len < TS_NUMBUF - 1 ? len : TS_NUMBUF - 1;
+    if (n) memcpy(b, s, n);
+    b[n] = 0;
+    return atof(b);
+}
+/* __attribute__ format so the compiler checks every call site too */
 #ifdef __GNUC__
 static void tpl_err(char *err, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 #endif
@@ -415,10 +452,14 @@ static void tpl_free(tpl_compiled *t) {
                 tpl_xform *x = &t->ops[i].chain[j];
                 if (x->param_str) free(x->param_str);
                 if (x->param_str2) free(x->param_str2);
+                /* Only the entry walk needs map_keys. Gating the four frees on
+                   it too assumed the group is all-or-nothing: parse_xform
+                   allocates them one at a time, so a failure on the FIRST left
+                   the other three unreachable. free(NULL) is a no-op. */
                 if (x->map_keys) {
                     for (int k = 0; k < x->map_count; k++) { free(x->map_keys[k]); free(x->map_vals[k]); }
-                    free(x->map_keys); free(x->map_vals); free(x->map_key_lens); free(x->map_val_lens);
                 }
+                free(x->map_keys); free(x->map_vals); free(x->map_key_lens); free(x->map_val_lens);
             }
             free(t->ops[i].chain);
         }
@@ -427,8 +468,22 @@ static void tpl_free(tpl_compiled *t) {
     free(t);
 }
 
+/* malloc + copy + NUL, the shape repeated all through the compile path.
+   Returns NULL and sets err on failure; every caller bails on NULL. Unchecked,
+   each of these was a memcpy through NULL, so a failed allocation while
+   compiling was a SIGSEGV. Compiling runs once per object, so the branch is
+   not on any path that matters. */
+static char *ts_dup_n(const char *src, STRLEN n, char *err) {
+    char *p = (char *)malloc(n + 1);
+    if (!p) { tpl_err(err, "out of memory"); return NULL; }
+    if (n) memcpy(p, src, n);
+    p[n] = '\0';
+    return p;
+}
+
 /* parse "type" or "type:param" or "type:param1:param2" */
 static tpl_xform parse_xform(const char *s, int len, char *err, char *soft) {
+    int known = 1;   /* cleared below if the name matches no transform */
     tpl_xform x = {XF_RAW, 0, NULL, 0, NULL, 0, 0, NULL, NULL, NULL, NULL, 0};
     const char *colon = memchr(s, ':', len);
     int tlen = colon ? (int)(colon - s) : len;
@@ -474,17 +529,18 @@ static tpl_xform parse_xform(const char *s, int len, char *err, char *soft) {
     else if (tlen == 8 && memcmp(s, "coalesce", 8) == 0) x.type = XF_COALESCE;
     /* An unknown name used to fall through as XF_RAW, so a typo in an escaping
        transform ("{0:hmtl}") silently emitted the value unescaped. */
-    else if (!(tlen == 3 && memcmp(s, "raw", 3) == 0)) {
+    else {
         /* Deferred: a stray literal brace (".cls { color: red }") also lands here,
            and the mixed-mode check downstream explains that far better, so only
            surface this if nothing more specific goes wrong. */
+        known = 0;
         if (tlen == 0) tpl_err(soft, "empty transform in chain (stray '|' or ':')");
         else tpl_err(soft, "unknown transform '%.*s'", tlen > TS_REFSZ ? TS_REFSZ : tlen, s);
     }
 
     if (param && plen == 0 && x.type == XF_DEFAULT) {
-        x.param_str = (char *)malloc(1);
-        x.param_str[0] = '\0';
+        x.param_str = ts_dup_n("", 0, err);
+        if (!x.param_str) return x;
         x.param_str_len = 0;
     } else if (param && plen > 0) {
         if (x.type == XF_FLOAT || x.type == XF_PAD || x.type == XF_RPAD || x.type == XF_TRUNC || x.type == XF_MASK) {
@@ -501,33 +557,28 @@ static tpl_xform parse_xform(const char *s, int len, char *err, char *soft) {
             if (x.type == XF_FLOAT && v > 30) v = 30;
             x.param_int = v;
         } else if (x.type == XF_SPRINTF) {
-            x.param_str = (char *)malloc(plen + 1);
-            memcpy(x.param_str, param, plen);
-            x.param_str[plen] = '\0';
+            x.param_str = ts_dup_n(param, plen, err);
+            if (!x.param_str) return x;
             x.param_str_len = plen;
         } else if (x.type == XF_REPLACE) {
             const char *c2 = memchr(param, ':', plen);
             /* "replace:OLD" deletes OLD; it used to set no needle and no-op */
-            if (!c2 && plen > 0) {
-                x.param_str = (char *)malloc(plen + 1);
-                memcpy(x.param_str, param, plen);
-                x.param_str[plen] = '\0';
+            if (!c2) {
+                x.param_str = ts_dup_n(param, plen, err);
+                if (!x.param_str) return x;
                 x.param_str_len = plen;
-                x.param_str2 = (char *)malloc(1);
-                x.param_str2[0] = '\0';
+                x.param_str2 = ts_dup_n("", 0, err);
+                if (!x.param_str2) return x;
                 x.param_str2_len = 0;
-            }
-            if (c2) {
+            } else {
                 int p1len = (int)(c2 - param);
                 int p2len = plen - p1len - 1;
                 if (p1len > 0) {
-                    x.param_str = (char *)malloc(p1len + 1);
-                    memcpy(x.param_str, param, p1len);
-                    x.param_str[p1len] = '\0';
+                    x.param_str = ts_dup_n(param, p1len, err);
+                    if (!x.param_str) return x;
                     x.param_str_len = p1len;
-                    x.param_str2 = (char *)malloc(p2len + 1);
-                    memcpy(x.param_str2, c2 + 1, p2len);
-                    x.param_str2[p2len] = '\0';
+                    x.param_str2 = ts_dup_n(c2 + 1, p2len, err);
+                    if (!x.param_str2) return x;
                     x.param_str2_len = p2len;
                 }
             }
@@ -567,45 +618,40 @@ static tpl_xform parse_xform(const char *s, int len, char *err, char *soft) {
             const char *c2 = memchr(param, ':', plen);
             int p1len = c2 ? (int)(c2 - param) : plen;
             int p2len = c2 ? plen - p1len - 1 : -1;
-            x.param_str = (char *)malloc(p1len + 1);
-            memcpy(x.param_str, param, p1len);
-            x.param_str[p1len] = '\0';
+            x.param_str = ts_dup_n(param, p1len, err);
+            if (!x.param_str) return x;
             x.param_str_len = p1len;
             if (c2) {
-                x.param_str2 = (char *)malloc(p2len + 1);
-                memcpy(x.param_str2, c2 + 1, p2len);
-                x.param_str2[p2len] = '\0';
+                x.param_str2 = ts_dup_n(c2 + 1, p2len, err);
+                if (!x.param_str2) return x;
                 x.param_str2_len = p2len;
             } else {
                 /* one form given: plural is that form plus "s" */
                 x.param_str2 = (char *)malloc(p1len + 2);
+                if (!x.param_str2) { tpl_err(err, "out of memory"); return x; }
                 memcpy(x.param_str2, param, p1len);
                 x.param_str2[p1len] = 's';
                 x.param_str2[p1len + 1] = '\0';
                 x.param_str2_len = p1len + 1;
             }
         } else if (x.type == XF_IF || x.type == XF_UNLESS) {
-            x.param_str = (char *)malloc(plen + 1);
-            memcpy(x.param_str, param, plen);
-            x.param_str[plen] = '\0';
+            x.param_str = ts_dup_n(param, plen, err);
+            if (!x.param_str) return x;
             x.param_str_len = plen;
         } else if (x.type == XF_WRAP) {
             const char *c2 = memchr(param, ':', plen);
             if (c2) {
                 int p1len = (int)(c2 - param);
                 int p2len = plen - p1len - 1;
-                x.param_str = (char *)malloc(p1len + 1);
-                memcpy(x.param_str, param, p1len);
-                x.param_str[p1len] = '\0';
+                x.param_str = ts_dup_n(param, p1len, err);
+                if (!x.param_str) return x;
                 x.param_str_len = p1len;
-                x.param_str2 = (char *)malloc(p2len + 1);
-                memcpy(x.param_str2, c2 + 1, p2len);
-                x.param_str2[p2len] = '\0';
+                x.param_str2 = ts_dup_n(c2 + 1, p2len, err);
+                if (!x.param_str2) return x;
                 x.param_str2_len = p2len;
             } else {
-                x.param_str = (char *)malloc(plen + 1);
-                memcpy(x.param_str, param, plen);
-                x.param_str[plen] = '\0';
+                x.param_str = ts_dup_n(param, plen, err);
+                if (!x.param_str) return x;
                 x.param_str_len = plen;
             }
         } else if (x.type == XF_MAP) {
@@ -615,6 +661,13 @@ static tpl_xform parse_xform(const char *s, int len, char *err, char *soft) {
             x.map_vals = (char **)calloc(cnt, sizeof(char *));
             x.map_key_lens = (STRLEN *)calloc(cnt, sizeof(STRLEN));
             x.map_val_lens = (STRLEN *)calloc(cnt, sizeof(STRLEN));
+            /* all four or none: the loop below indexes them in lockstep, and
+               tpl_free only walks them when map_count says there is something
+               to walk, so leaving map_count at 0 here is safe to free */
+            if (!x.map_keys || !x.map_vals || !x.map_key_lens || !x.map_val_lens) {
+                tpl_err(err, "out of memory");
+                return x;
+            }
             x.map_count = 0;
             const char *p2 = param, *pe = param + plen;
             while (p2 < pe) {
@@ -623,42 +676,54 @@ static tpl_xform parse_xform(const char *s, int len, char *err, char *soft) {
                 const char *eq = memchr(p2, '=', next - p2);
                 if (eq) {
                     int kl = (int)(eq - p2), vl = (int)(next - eq - 1);
-                    int idx = x.map_count++;
-                    x.map_keys[idx] = (char *)malloc(kl + 1); memcpy(x.map_keys[idx], p2, kl); x.map_keys[idx][kl] = '\0'; x.map_key_lens[idx] = kl;
-                    x.map_vals[idx] = (char *)malloc(vl + 1); memcpy(x.map_vals[idx], eq + 1, vl); x.map_vals[idx][vl] = '\0'; x.map_val_lens[idx] = vl;
+                    int idx = x.map_count;
+                    x.map_keys[idx] = ts_dup_n(p2, kl, err);
+                    if (!x.map_keys[idx]) return x;
+                    x.map_key_lens[idx] = kl;
+                    x.map_vals[idx] = ts_dup_n(eq + 1, vl, err);
+                    if (!x.map_vals[idx]) { free(x.map_keys[idx]); x.map_keys[idx] = NULL; return x; }
+                    x.map_val_lens[idx] = vl;
+                    /* bumped only once the pair is complete, so a half-built
+                       entry is never handed to tpl_free */
+                    x.map_count++;
                 }
                 p2 = next + 1;
             }
         } else if (x.type == XF_COALESCE) {
-            x.param_str = (char *)malloc(plen + 1);
-            memcpy(x.param_str, param, plen);
-            x.param_str[plen] = '\0';
+            x.param_str = ts_dup_n(param, plen, err);
+            if (!x.param_str) return x;
             x.param_str_len = plen;
         } else if (x.type == XF_DEFAULT || x.type == XF_DATE) {
-            x.param_str = (char *)malloc(plen + 1);
-            memcpy(x.param_str, param, plen);
-            x.param_str[plen] = '\0';
+            x.param_str = ts_dup_n(param, plen, err);
+            if (!x.param_str) return x;
             x.param_str_len = plen;
         } else if (x.type == XF_BOOL) {
             const char *c2 = memchr(param, ':', plen);
             if (c2) {
                 int p1len = (int)(c2 - param);
                 int p2len = plen - p1len - 1;
-                x.param_str = (char *)malloc(p1len + 1);
-                memcpy(x.param_str, param, p1len);
-                x.param_str[p1len] = '\0';
+                x.param_str = ts_dup_n(param, p1len, err);
+                if (!x.param_str) return x;
                 x.param_str_len = p1len;
-                x.param_str2 = (char *)malloc(p2len + 1);
-                memcpy(x.param_str2, c2 + 1, p2len);
-                x.param_str2[p2len] = '\0';
+                x.param_str2 = ts_dup_n(c2 + 1, p2len, err);
+                if (!x.param_str2) return x;
                 x.param_str2_len = p2len;
             } else {
-                x.param_str = (char *)malloc(plen + 1);
-                memcpy(x.param_str, param, plen);
-                x.param_str[plen] = '\0';
+                x.param_str = ts_dup_n(param, plen, err);
+                if (!x.param_str) return x;
                 x.param_str_len = plen;
-                x.param_str2 = NULL; x.param_str2_len = 0;
             }
+        }
+        /* Nothing above claimed the parameter, so this transform does not take
+           one and it was about to be dropped on the floor -- the same silent
+           no-op an unknown transform name and an unknown option are rejected
+           for. Only for a name we recognise, though: an unknown one already has
+           a better message waiting in `soft`, and a hard error here would
+           preempt it and blame a transform that does not exist. */
+        else if (known) {
+            tpl_err(err, "'%.*s' takes no parameter, got '%.*s'",
+                    tlen, s, plen, param);
+            return x;
         }
     }
     return x;
@@ -684,6 +749,7 @@ static void parse_field_spec(const char *spec, int spec_len,
         /* parse transform chain if any */
         if (!sep) {
             op->chain = (tpl_xform *)malloc(sizeof(tpl_xform));
+            if (!op->chain) { tpl_err(err, "out of memory"); return; }
             op->chain[0] = ts_raw_xform;
             op->chain_len = 1;
             return;
@@ -707,23 +773,28 @@ static void parse_field_spec(const char *spec, int spec_len,
         /* Check before multiplying, and in int: testing `long col > INT_MAX`
            afterwards never fires where long is 32 bits (ILP32, and Win64's
            LLP64), so the accumulation just wrapped to a wrong column. */
-        int col = 0;
+        /* Accumulate the magnitude unsigned: a negative index reaches one
+           further than a positive one, and bounding both at INT_MAX rejected
+           exactly INT_MIN -- which skip_if and the sort spec accept, so the
+           same index was valid in one place and not another. */
+        unsigned lim = (unsigned)INT_MAX + (is_neg ? 1u : 0u);
+        unsigned col = 0;
         for (int i = start_idx; i < field_len; i++) {
-            int d = field[i] - '0';
-            if (col > (INT_MAX - d) / 10) {
+            unsigned d = (unsigned)(field[i] - '0');
+            if (col > (lim - d) / 10) {
                 tpl_err(err, "column index '%.*s' is out of range", field_len, field);
                 return;
             }
             col = col * 10 + d;
         }
-        op->col = (int)(is_neg ? -col : col);
+        /* negate as unsigned, then convert: -(int)2147483648 would be UB */
+        op->col = is_neg ? (int)(0u - col) : (int)col;
         if (!num_ref[0]) snprintf(num_ref, TS_REFSZ, "%.*s", field_len, field);
     } else {
         *mode = ROW_HASH;
         if (!key_ref[0]) snprintf(key_ref, TS_REFSZ, "%.*s", field_len, field);
-        op->key = (char *)malloc(field_len + 1);
-        memcpy(op->key, field, field_len);
-        op->key[field_len] = '\0';
+        op->key = ts_dup_n(field, field_len, err);
+        if (!op->key) return;
         op->key_len = field_len;
         op->key_utf8 = tpl_key_utf8;
     }
@@ -731,6 +802,7 @@ static void parse_field_spec(const char *spec, int spec_len,
     /* parse transform chain */
     if (!sep) {
         op->chain = (tpl_xform *)malloc(sizeof(tpl_xform));
+        if (!op->chain) { tpl_err(err, "out of memory"); return; }
         op->chain[0] = ts_raw_xform;
         op->chain_len = 1;
         return;
@@ -746,6 +818,7 @@ parse_chain:;
     for (int i = 0; i < xforms_len; i++) if (xforms_start[i] == '|') nxforms++;
 
     op->chain = (tpl_xform *)malloc(nxforms * sizeof(tpl_xform));
+    if (!op->chain) { tpl_err(err, "out of memory"); return; }
     op->chain_len = 0;
 
     const char *p = xforms_start;
@@ -782,14 +855,35 @@ static tpl_compiled *tpl_compile(pTHX_ const char *header, STRLEN hlen,
     tpl_compiled *t = (tpl_compiled *)calloc(1, sizeof(tpl_compiled));
     if (!t) { tpl_err(err, "out of memory"); return NULL; }
     char soft_err[TS_ERRSZ]; soft_err[0] = '\0';
-    if (hlen) { t->header = (char *)malloc(hlen); memcpy(t->header, header, hlen); } t->header_len = hlen;
-    if (flen) { t->footer = (char *)malloc(flen); memcpy(t->footer, footer, flen); } t->footer_len = flen;
-    if (slen) { t->sep = (char *)malloc(slen); memcpy(t->sep, sep, slen); t->sep_len = slen; }
+    /* these three are length-counted, not NUL-terminated, so they allocate
+       exactly hlen/flen/slen rather than going through ts_dup_n */
+    if (hlen) { t->header = (char *)malloc(hlen);
+                if (!t->header) { tpl_err(err, "out of memory"); return t; }
+                memcpy(t->header, header, hlen); } t->header_len = hlen;
+    if (flen) { t->footer = (char *)malloc(flen);
+                if (!t->footer) { tpl_err(err, "out of memory"); return t; }
+                memcpy(t->footer, footer, flen); } t->footer_len = flen;
+    if (slen) { t->sep = (char *)malloc(slen);
+                if (!t->sep) { tpl_err(err, "out of memory"); return t; }
+                memcpy(t->sep, sep, slen); t->sep_len = slen; }
     t->mode = ROW_ARRAY;
     t->escape_char = esc_char ? esc_char : '{';
 
+    /* The row is split on raw bytes, so a delimiter above 0x7F cuts inside a
+       multi-byte character of a decoded template -- from_file always decodes --
+       and every piece stays flagged: render() and columns() then return SvUTF8
+       strings whose bytes are not UTF-8, and uc() on them dies. Flagging the
+       output as bytes would still leave columns() broken, so refuse instead.
+       Byte templates are unaffected. */
+    if ((unsigned char)t->escape_char >= 0x80 && (tpl_utf8 & TS_TPL_ROW)) {
+        tpl_err(err, "escape_char must be an ASCII byte when the row template "
+                     "is a character string");
+        return t;
+    }
+
     int cap = 16;
     t->ops = (tpl_op *)calloc(cap, sizeof(tpl_op));
+    if (!t->ops) { tpl_err(err, "out of memory"); return t; }
     t->nops = 0;
 
     char close_char = (t->escape_char == '{') ? '}' : t->escape_char;
@@ -816,6 +910,7 @@ static tpl_compiled *tpl_compile(pTHX_ const char *header, STRLEN hlen,
             tpl_op *op = &t->ops[t->nops++];
             memset(op, 0, sizeof(*op));
             op->static_data = (char *)malloc(brace - p);
+            if (!op->static_data) { tpl_err(err, "out of memory"); return t; }
             memcpy(op->static_data, p, brace - p);
             op->static_len = brace - p;
         }
@@ -827,6 +922,7 @@ static tpl_compiled *tpl_compile(pTHX_ const char *header, STRLEN hlen,
             tpl_op *op = &t->ops[t->nops++];
             memset(op, 0, sizeof(*op));
             op->static_data = (char *)malloc(1);
+            if (!op->static_data) { tpl_err(err, "out of memory"); return t; }
             op->static_data[0] = t->escape_char;
             op->static_len = 1;
             p = brace + 2;
@@ -862,6 +958,8 @@ static tpl_compiled *tpl_compile(pTHX_ const char *header, STRLEN hlen,
      || (!(tpl_utf8 & TS_TPL_SEP) && t->sep    && has_high_byte(t->sep,    t->sep_len))
      || (!(tpl_utf8 & TS_TPL_ROW) && has_high_byte(row, rlen));
 
+    t->saw_num_ref = num_ref[0] ? 1 : 0;
+
     /* one row mode per template; name both offenders, since a stray literal
        delimiter in the text lands here */
     if (num_ref[0] && key_ref[0]) {
@@ -878,7 +976,10 @@ static tpl_compiled *tpl_compile(pTHX_ const char *header, STRLEN hlen,
 
 /* ---- render ---- */
 
-#define BUF_ENSURE(need) do { if (pos + (need) > alloc) { alloc = (pos + (need)) * 2; buf = (char *)realloc(buf, alloc); if (!buf) croak("Text::Stencil: out of memory"); t->inflight = buf; } } while(0)
+/* clamp rather than double past the top: where STRLEN is 32 bits the
+   doubling wraps and under-reserves the buffer it is meant to grow */
+#define TS_GROW(want) ((want) <= (STRLEN)-1 / 2 ? (want) * 2 : (STRLEN)-1)
+#define BUF_ENSURE(need) do { if (pos + (need) > alloc) { alloc = TS_GROW(pos + (need)); buf = (char *)realloc(buf, alloc); if (!buf) croak("Text::Stencil: out of memory"); t->inflight = buf; } } while(0)
 /* Say so rather than drop rows on a full disk or closed pipe; both callers
    keep the render buffer in `buf` */
 #define FH_WRITE(fh, b, n) do { \
@@ -893,6 +994,16 @@ static tpl_compiled *tpl_compile(pTHX_ const char *header, STRLEN hlen,
 
 /* the length guard keeps memcpy(dst, NULL, 0) out of the empty header/footer paths */
 #define BUF_WRITE(s, l) do { if (l) { BUF_ENSURE(l); memcpy(buf + pos, s, l); pos += l; } } while(0)
+
+/* Pin a row for the duration of its render: skip tests and field rendering both
+   run Perl (tie, overload, DESTROY) that can clear the slot, realloc AvARRAY or
+   drop the caller's last reference. PL_sv_undef is exempt -- it is immortal, so
+   it needs no pin, and sv_2mortal returns early for an immortal without
+   registering it, which left the increment unmatched and leaked a reference per
+   undef row. */
+#define TS_PIN_ROW(sv) STMT_START { \
+    if (LIKELY((sv) != &PL_sv_undef)) sv_2mortal(SvREFCNT_inc_simple_NN(sv)); \
+} STMT_END
 
 /* reusable buffer macros for render_buf */
 #define TS_INFLIGHT_ARM(t) do { \
@@ -970,9 +1081,6 @@ PERL_STATIC_INLINE SV *av_element(pTHX_ AV *av, int col) {
     }
 }
 
-/* Own the bytes of a template piece. Pinning the argument SV keeps it alive but
-   not its buffer: stringifying a later argument can run an overload that grows
-   an earlier one in place, freeing the PV we were still holding. */
 /* Buffer the format is assembled in; a format that will not fit is one we do
    not handle, so the size belongs with the check that rejects it. */
 #define TS_FMTBUF 64
@@ -994,7 +1102,7 @@ static char ts_sprintf_conv(const char *f) {
     if (flen < 1) return 0;
     /* a format that will not fit in the assembly buffer is one we do not
        handle; the .%. is added when absent, so count it either way */
-    if ((f[0] == 0x25 ? flen : flen + 1) + 3 > (STRLEN)TS_FMTBUF) return 0;
+    if ((f[0] == '%' ? flen : flen + 1) + 3 > (STRLEN)TS_FMTBUF) return 0;
     fi = (f[0] == '%') ? 1 : 0;
     while (fi < flen && (f[fi] == '-' || f[fi] == '+' ||
                          f[fi] == ' ' || f[fi] == '#' || f[fi] == '0')) fi++;
@@ -1011,6 +1119,9 @@ static char ts_sprintf_conv(const char *f) {
     return 0;
 }
 
+/* Own the bytes of a template piece. Pinning the argument SV keeps it alive
+   but not its buffer: stringifying a later argument can run an overload that
+   grows an earlier one in place, freeing the PV we were still holding. */
 static const char *ts_own_pv(pTHX_ SV *sv, STRLEN *lenp, int *utf8p) {
     STRLEN l;
     const char *p = SvPV(sv, l);
@@ -1022,13 +1133,24 @@ static const char *ts_own_pv(pTHX_ SV *sv, STRLEN *lenp, int *utf8p) {
     return SvPVX(owned);
 }
 
+/* Install a skip-condition key on a template that no SV owns yet: the croak
+   has to reclaim it, or a failed allocation strands the whole thing. All four
+   call sites -- new's two and clone's two -- were this same sequence. */
+static void ts_set_skip_key(pTHX_ tpl_compiled *t, char **dst, STRLEN *lenp,
+                            int *utf8p, const char *src, STRLEN len, int utf8) {
+    char *p = (char *)malloc(len + 1);
+    if (!p) { tpl_free(t); croak("Text::Stencil: out of memory"); }
+    if (len) memcpy(p, src, len);
+    p[len] = '\0';
+    *dst = p; *lenp = len; *utf8p = utf8;
+}
+
 /* Column indices are ints. A wider IV would narrow onto some unrelated valid
    column, so reject it the way an out-of-range template index is rejected.
-   `owner` is a template not yet attached to an object, which the croak would
-   otherwise strand; pass NULL when the object already owns it. */
-static int ts_col_iv(pTHX_ IV v, const char *what, tpl_compiled *owner) {
+   Every caller resolves its columns before tpl_compile runs, so there is never
+   a half-built template for the croak to strand. */
+static int ts_col_iv(pTHX_ IV v, const char *what) {
     if (v > INT_MAX || v < INT_MIN) {
-        if (owner) tpl_free(owner);
         croak("Text::Stencil: %s column index %" IVdf " is out of range", what, v);
     }
     return (int)v;
@@ -1037,14 +1159,13 @@ static int ts_col_iv(pTHX_ IV v, const char *what, tpl_compiled *owner) {
 /* Same check, but from the SV: SvIV has already saturated or wrapped by the
    time we see it, so "99999999999999999999" arrives as -1 and would quietly
    become the last column. The NV still knows how big the value really was. */
-static int ts_col_sv(pTHX_ SV *sv, const char *what, tpl_compiled *owner) {
+static int ts_col_sv(pTHX_ SV *sv, const char *what) {
     NV nv = SvNV(sv);
     if (!(nv >= (NV)INT_MIN && nv <= (NV)INT_MAX)) {   /* false for NaN too */
-        if (owner) tpl_free(owner);
         croak("Text::Stencil: %s column index '%s' is out of range",
               what, SvPV_nolen(sv));
     }
-    return ts_col_iv(aTHX_ SvIV(sv), what, owner);
+    return ts_col_iv(aTHX_ SvIV(sv), what);
 }
 
 PERL_STATIC_INLINE SV *fetch_field(pTHX_ SV *row_sv, tpl_op *op, enum row_mode mode) {
@@ -1104,7 +1225,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
     /* macro to write to either output or temp */
     #define OUT_ENSURE(n) do { \
         if (to_output) { BUF_ENSURE(n); } \
-        else { if ((STRLEN)(n) > tmp_alloc || !tmp) { tmp_alloc = (n) < 1 ? 1 : (STRLEN)(n) * 2; tmp = (char *)realloc(tmp, tmp_alloc); if (!tmp) croak("Text::Stencil: out of memory"); } } \
+        else { if ((STRLEN)(n) > tmp_alloc || !tmp) { tmp_alloc = (n) < 1 ? 1 : TS_GROW((STRLEN)(n)); tmp = (char *)realloc(tmp, tmp_alloc); if (!tmp) croak("Text::Stencil: out of memory"); } } \
     } while(0)
     /* A transform whose output is a multiple of its input must reserve that
        multiple. Where STRLEN is 32 bits the product can wrap while the input
@@ -1116,41 +1237,42 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         OUT_ENSURE(n_ * m_); \
     } while(0)
     #define OUT_PTR (to_output ? buf + pos : tmp)
+    /* Every transform ends by publishing how much it wrote, to whichever of the
+       two destinations OUT_PTR selected. It was spelled out 46 times. */
+    #define OUT_COMMIT(n) do { if (to_output) pos += (n); else tmp_len = (n); } while (0)
+    /* and nine of them are exactly "emit the input unchanged" */
+    #define OUT_PASSTHRU() do { OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen); OUT_COMMIT(slen); } while (0)
 
     /* the widths below are ints; past INT_MAX one wraps negative and corrupts
        the write offset, and no transform has a useful answer for 2GB anyway */
     if (UNLIKELY(slen > (STRLEN)INT_MAX)) {
-        OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-        if (to_output) pos += slen; else tmp_len = slen;
+        OUT_PASSTHRU();
         goto done;
     }
 
     switch (xf->type) {
     case XF_INT: {
         OUT_ENSURE(20);
-        int neg = 0;
-        for (STRLEN i = 0; i < slen; i++) if (src[i] == 0x2d) { neg = 1; break; }
+        int neg = ts_has_minus(src, slen);
         IV v = ts_scan_iv(src, slen, neg);
         int w = itoa_fast(OUT_PTR, v);
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_INT_COMMA: {
         OUT_ENSURE(28);
-        int neg = 0;
-        for (STRLEN i = 0; i < slen; i++) if (src[i] == 0x2d) { neg = 1; break; }
+        int neg = ts_has_minus(src, slen);
         IV v = ts_scan_iv(src, slen, neg);
         int w = itoa_comma(OUT_PTR, v);
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_FLOAT: {
         OUT_ENSURE(TS_FLTSZ);
-        double fv = 0;
-        { char tb[64]; int tl = slen < 63 ? (int)slen : 63; memcpy(tb, src, tl); tb[tl] = 0; fv = atof(tb); }
+        double fv = ts_atof(src, slen);
         int w = snprintf(OUT_PTR, TS_FLTSZ, "%.*f", xf->param_int, fv);
         if (w > TS_FLTSZ - 1) w = TS_FLTSZ - 1;
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_HTML: {
@@ -1160,10 +1282,10 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             if (html_special[(unsigned char)src[i]]) { needs_escape = 1; break; }
         if (!needs_escape) {
             memcpy(OUT_PTR, src, slen);
-            if (to_output) pos += slen; else tmp_len = slen;
+            OUT_COMMIT(slen);
         } else {
             STRLEN w = html_escape(OUT_PTR, src, slen);
-            if (to_output) pos += w; else tmp_len = w;
+            OUT_COMMIT(w);
         }
         break;
     }
@@ -1174,17 +1296,17 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             if (html_br_special[(unsigned char)src[i]]) { needs_escape = 1; break; }
         if (!needs_escape) {
             memcpy(OUT_PTR, src, slen);
-            if (to_output) pos += slen; else tmp_len = slen;
+            OUT_COMMIT(slen);
         } else {
             STRLEN w = html_br_escape(OUT_PTR, src, slen);
-            if (to_output) pos += w; else tmp_len = w;
+            OUT_COMMIT(w);
         }
         break;
     }
     case XF_URL: {
         TS_OUT_ENSURE_MUL(slen, 3);
         STRLEN w = url_escape(OUT_PTR, src, slen);
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_JSON: {
@@ -1194,10 +1316,10 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             if (json_special[(unsigned char)src[i]]) { needs_escape = 1; break; }
         if (!needs_escape) {
             memcpy(OUT_PTR, src, slen);
-            if (to_output) pos += slen; else tmp_len = slen;
+            OUT_COMMIT(slen);
         } else {
             STRLEN w = json_escape(OUT_PTR, src, slen);
-            if (to_output) pos += w; else tmp_len = w;
+            OUT_COMMIT(w);
         }
         break;
     }
@@ -1207,7 +1329,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         while (l > 0 && (s[l-1] == ' ' || s[l-1] == '\t' || s[l-1] == '\n' || s[l-1] == '\r')) l--;
         OUT_ENSURE(l);
         memcpy(OUT_PTR, s, l);
-        if (to_output) pos += l; else tmp_len = l;
+        OUT_COMMIT(l);
         break;
     }
     /* ASCII-only by hand: toupper/tolower follow LC_CTYPE, and in an 8-bit
@@ -1219,7 +1341,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             unsigned char c = (unsigned char)src[i];
             OUT_PTR[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
         }
-        if (to_output) pos += slen; else tmp_len = slen;
+        OUT_COMMIT(slen);
         break;
     }
     case XF_LC: {
@@ -1228,7 +1350,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             unsigned char c = (unsigned char)src[i];
             OUT_PTR[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
         }
-        if (to_output) pos += slen; else tmp_len = slen;
+        OUT_COMMIT(slen);
         break;
     }
     case XF_PAD: {
@@ -1238,7 +1360,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         if (pad > 0) { memset(OUT_PTR, ' ', pad); memcpy(OUT_PTR + pad, src, slen); }
         else memcpy(OUT_PTR, src, slen);
         int total = pad > 0 ? w : (int)slen;
-        if (to_output) pos += total; else tmp_len = total;
+        OUT_COMMIT(total);
         break;
     }
     case XF_RPAD: {
@@ -1248,55 +1370,57 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         int pad = w - (int)slen;
         if (pad > 0) memset(OUT_PTR + slen, ' ', pad);
         int total = pad > 0 ? w : (int)slen;
-        if (to_output) pos += total; else tmp_len = total;
+        OUT_COMMIT(total);
         break;
     }
     case XF_TRUNC: {
         int mx = xf->param_int;
         if (mx < 0) mx = 0;
         if ((int)slen <= mx) {
-            OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-            if (to_output) pos += slen; else tmp_len = slen;
+            OUT_PASSTHRU();
         } else if (mx <= 3) {
             /* no room for the ellipsis: hard cut, never longer than asked */
             TS_NOTE_CUT(t, src, slen, mx);
             OUT_ENSURE(mx); memcpy(OUT_PTR, src, mx);
-            if (to_output) pos += mx; else tmp_len = mx;
+            OUT_COMMIT(mx);
         } else {
             int tl = mx - 3;
             TS_NOTE_CUT(t, src, slen, tl);
             OUT_ENSURE(tl + 3);
             memcpy(OUT_PTR, src, tl);
             memcpy(OUT_PTR + tl, "...", 3);
-            if (to_output) pos += tl + 3; else tmp_len = tl + 3;
+            OUT_COMMIT(tl + 3);
         }
         break;
     }
     case XF_HEX: {
         TS_OUT_ENSURE_MUL(slen, 2);
         STRLEN w = hex_encode(OUT_PTR, src, slen);
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_BASE64: {
         OUT_ENSURE(((slen + 2) / 3) * 4);
         STRLEN w = base64_encode(OUT_PTR, (const unsigned char *)src, slen);
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_BASE64URL: {
         OUT_ENSURE(((slen + 2) / 3) * 4);
         STRLEN w = base64url_encode(OUT_PTR, (const unsigned char *)src, slen);
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_COUNT: {
-        /* unreachable: count must be the first transform (compile-time croak
-           otherwise) and is handled in render_field before apply_xform; kept
-           for -Wswitch completeness */
+        /* Reached by {#:count}: render_field handles count itself, but that
+           handler is gated on !is_rownum, and param_int is 0 -- which is what
+           count documents for a scalar, so the row number lands right. An
+           undef field used to arrive here too, via use_default, and printed 0
+           over whatever default had supplied; render_field now drops the
+           count stage in that case instead. */
         OUT_ENSURE(12);
         int w = itoa_fast(OUT_PTR, xf->param_int);
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_BOOL: {
@@ -1311,7 +1435,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             vlen = xf->param_str2 ? xf->param_str2_len : 5;
         }
         OUT_ENSURE(vlen); memcpy(OUT_PTR, val, vlen);
-        if (to_output) pos += vlen; else tmp_len = vlen;
+        OUT_COMMIT(vlen);
         break;
     }
     case XF_DATE: {
@@ -1344,14 +1468,13 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         /* %B/%A/%c/%p emit locale text, which in an 8-bit LC_TIME is not UTF-8;
            we cannot judge it here, so make the final validation settle it */
         if (w) t->r_skipped = 1;
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_SPRINTF: {
-        OUT_ENSURE(256);
+
         if (!xf->param_str || xf->param_str_len == 0) {   /* no format: passthrough */
-            OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-            if (to_output) pos += slen; else tmp_len = slen;
+            OUT_PASSTHRU();
         } else {
             /* One definition decides what a format means. render_field asks the
                same question before numifying the value, and if the two answers
@@ -1359,16 +1482,14 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
                already converted. */
             char last = ts_sprintf_conv(xf->param_str);
             if (!last) {
-                OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-                if (to_output) pos += slen; else tmp_len = slen;
+                OUT_PASSTHRU();
                 break;
             }
             char fmtbuf[TS_FMTBUF];
             int fmtlen = snprintf(fmtbuf, sizeof(fmtbuf), "%s%s",
                 xf->param_str[0] == '%' ? "" : "%", xf->param_str);
             if (fmtlen < 0 || fmtlen + 2 > (int)sizeof(fmtbuf)) {
-                OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-                if (to_output) pos += slen; else tmp_len = slen;
+                OUT_PASSTHRU();
                 break;
             }
             int is_int = (last == 'd' || last == 'i' || last == 'x' ||
@@ -1383,8 +1504,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
                                  : (last == 'X') ? UVXf : UVxf;
                 size_t clen = strlen(conv);
                 if ((size_t)fmtlen + clen >= sizeof(fmtbuf)) {
-                    OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-                    if (to_output) pos += slen; else tmp_len = slen;
+                    OUT_PASSTHRU();
                     break;
                 }
                 memcpy(fmtbuf + fmtlen - 1, conv, clen);
@@ -1396,13 +1516,10 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             IV lv = 0; double dv = 0;
             char *sv_heap = NULL; const char *sv_tb = NULL;
             if (is_int) {
-                int neg = 0;
-                for (STRLEN i = 0; i < slen; i++) if (src[i] == '-') { neg = 1; break; }
+                int neg = ts_has_minus(src, slen);
                 lv = ts_scan_iv(src, slen, neg);
             } else if (last == 'f' || last == 'e' || last == 'g') {
-                char tb[64]; int tl = slen < 63 ? (int)slen : 63;
-                memcpy(tb, src, tl); tb[tl] = 0;
-                dv = atof(tb);
+                dv = ts_atof(src, slen);
             } else if (slen < sizeof(stackbuf)) {
                 /* a precision on %s cuts bytes, and the padded output width is
                    not the cut offset, so leave it to the final validation */
@@ -1426,14 +1543,13 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             if (w < 0) w = 0;
             #undef TS_SPRINTF
             if (sv_heap) free(sv_heap);
-            if (to_output) pos += w; else tmp_len = w;
+            OUT_COMMIT(w);
         }
         break;
     }
     case XF_REPLACE: {
         if (!xf->param_str) {
-            OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-            if (to_output) pos += slen; else tmp_len = slen;
+            OUT_PASSTHRU();
             break;
         }
         const char *needle = xf->param_str;
@@ -1452,7 +1568,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
                 out[opos++] = src[i++];
             }
         }
-        if (to_output) pos += opos; else tmp_len = opos;
+        OUT_COMMIT(opos);
         break;
     }
     case XF_SUBSTR: {
@@ -1470,12 +1586,12 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             TS_NOTE_CUT(t, src, slen, start + l);  /* ends mid-character? */
         }
         OUT_ENSURE(l); memcpy(OUT_PTR, s, l);
-        if (to_output) pos += l; else tmp_len = l;
+        OUT_COMMIT(l);
         break;
     }
     case XF_PLURAL: {
         /* a leading .-. is the sign; -1 is plural, and itoa keeps the .-. */
-        STRLEN pi = (slen > 0 && src[0] == 0x2d) ? 1 : 0;
+        STRLEN pi = (slen > 0 && src[0] == '-') ? 1 : 0;
         IV v = ts_scan_iv(src + pi, slen - pi, pi ? 1 : 0);
         const char *form; STRLEN flen;
         if (v == 1) {
@@ -1487,8 +1603,8 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         int nw = itoa_fast(OUT_PTR, v);
         OUT_PTR[nw] = ' ';
         memcpy(OUT_PTR + nw + 1, form, flen);
-        int total = nw + 1 + (int)flen;
-        if (to_output) pos += total; else tmp_len = total;
+        STRLEN total = (STRLEN)nw + 1 + flen;
+        OUT_COMMIT(total);
         break;
     }
     case XF_IF: {
@@ -1496,7 +1612,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         if (truthy && xf->param_str) {
             OUT_ENSURE(xf->param_str_len);
             memcpy(OUT_PTR, xf->param_str, xf->param_str_len);
-            if (to_output) pos += xf->param_str_len; else tmp_len = xf->param_str_len;
+            OUT_COMMIT(xf->param_str_len);
         } else {
             if (!to_output) tmp_len = 0;
         }
@@ -1507,7 +1623,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         if (!truthy && xf->param_str) {
             OUT_ENSURE(xf->param_str_len);
             memcpy(OUT_PTR, xf->param_str, xf->param_str_len);
-            if (to_output) pos += xf->param_str_len; else tmp_len = xf->param_str_len;
+            OUT_COMMIT(xf->param_str_len);
         } else {
             if (!to_output) tmp_len = 0;
         }
@@ -1523,30 +1639,33 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             }
         }
         OUT_ENSURE(vlen); memcpy(OUT_PTR, val, vlen);
-        if (to_output) pos += vlen; else tmp_len = vlen;
+        OUT_COMMIT(vlen);
         break;
     }
     case XF_WRAP: {
         if (slen > 0 && !xf->param_str) {
             /* no prefix/suffix given: pass the value through */
-            OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-            if (to_output) pos += slen; else tmp_len = slen;
+            OUT_PASSTHRU();
         } else if (slen > 0 && xf->param_str) {
             STRLEN plen2 = xf->param_str_len + slen + (xf->param_str2 ? xf->param_str2_len : 0);
             OUT_ENSURE(plen2);
             memcpy(OUT_PTR, xf->param_str, xf->param_str_len);
-            int wpos = (int)xf->param_str_len;
+            /* STRLEN, not int: the guard above caps slen at INT_MAX, but this
+               is the one accumulator that ADDS to slen, so a prefix on a value
+               near the cap overflowed to negative and turned the length into
+               ~SIZE_MAX. Reachable without a 2GB scalar in hand: hex doubles a
+               1GB field to just under INT_MAX before wrap ever sees it. */
+            STRLEN wpos = xf->param_str_len;
             memcpy(OUT_PTR + wpos, src, slen); wpos += slen;
             if (xf->param_str2) { memcpy(OUT_PTR + wpos, xf->param_str2, xf->param_str2_len); wpos += xf->param_str2_len; }
-            if (to_output) pos += wpos; else tmp_len = wpos;
+            OUT_COMMIT(wpos);
         } else {
             if (!to_output) tmp_len = 0;
         }
         break;
     }
     case XF_NUMBER_SI: {
-        double v = 0;
-        { char tb[64]; int tl = slen < 63 ? (int)slen : 63; memcpy(tb, src, tl); tb[tl] = 0; v = atof(tb); }
+        double v = ts_atof(src, slen);
         {   /* a 32-byte cap chopped huge values mid-digit and dropped the suffix */
             int ti = si_tier(v, si_dec, 5);
             int w = ti ? snprintf(NULL, 0, "%.1f%s", v / si_dec[ti], si_dec_suf[ti])
@@ -1556,13 +1675,12 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             w = ti ? snprintf(OUT_PTR, (size_t)w + 1, "%.1f%s", v / si_dec[ti], si_dec_suf[ti])
                    : snprintf(OUT_PTR, (size_t)w + 1, "%.0f", v);
             if (w < 0) w = 0;
-            if (to_output) pos += w; else tmp_len = w;
+            OUT_COMMIT(w);
         }
         break;
     }
     case XF_BYTES_SI: {
-        double v = 0;
-        { char tb[64]; int tl = slen < 63 ? (int)slen : 63; memcpy(tb, src, tl); tb[tl] = 0; v = atof(tb); }
+        double v = ts_atof(src, slen);
         {
             int ti = si_tier(v, si_bin, 6);
             int w = ti ? snprintf(NULL, 0, "%.1f %s", v / si_bin[ti], si_bin_suf[ti])
@@ -1572,7 +1690,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
             w = ti ? snprintf(OUT_PTR, (size_t)w + 1, "%.1f %s", v / si_bin[ti], si_bin_suf[ti])
                    : snprintf(OUT_PTR, (size_t)w + 1, "%.0f B", v);
             if (w < 0) w = 0;
-            if (to_output) pos += w; else tmp_len = w;
+            OUT_COMMIT(w);
         }
         break;
     }
@@ -1586,7 +1704,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         if (v >= 60 && w < 63)    { int n = snprintf(OUT_PTR + w, 64 - w, "%" IVdf "m ", v / 60);    if (n > 0) w += n; v %= 60; }
         if (w < 63) { int n = snprintf(OUT_PTR + w, 64 - w, "%" IVdf "s", v); if (n > 0) w += n; }
         if (w > 63) w = 63;
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_AGO: {
@@ -1616,7 +1734,7 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         else if (diff < 31536000) w = snprintf(OUT_PTR, 32, "%" IVdf "mo ago", diff / 2592000);
         else w = snprintf(OUT_PTR, 32, "%" IVdf "y ago", diff / 31536000);
         if (w > 31) w = 31;
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_MASK: {
@@ -1626,25 +1744,25 @@ static void apply_xform(tpl_compiled *t, tpl_xform *xf, const char *src, STRLEN 
         if (keep > (int)slen) keep = (int)slen;
         OUT_ENSURE(slen);
         int mask_len = (int)slen - keep;
-        if (mask_len > 0) TS_NOTE_CUT(t, src, slen, mask_len);
-        if (mask_len > 0) memset(OUT_PTR, '*', mask_len);
+        if (mask_len > 0) {
+            TS_NOTE_CUT(t, src, slen, mask_len);
+            memset(OUT_PTR, '*', mask_len);
+        }
         if (keep > 0) memcpy(OUT_PTR + mask_len, src + slen - keep, keep);
         int total = (int)slen;
-        if (to_output) pos += total; else tmp_len = total;
+        OUT_COMMIT(total);
         break;
     }
     case XF_LENGTH: {
         OUT_ENSURE(20);
         int w = itoa_fast(OUT_PTR, (IV)slen);
-        if (to_output) pos += w; else tmp_len = w;
+        OUT_COMMIT(w);
         break;
     }
     case XF_COALESCE: /* handled in render_field, fallthrough to raw */
-    case XF_ROWNUM: /* should not appear in chain; rownum is handled by render_field */
     case XF_DEFAULT:
     case XF_RAW: {
-        OUT_ENSURE(slen); memcpy(OUT_PTR, src, slen);
-        if (to_output) pos += slen; else tmp_len = slen;
+        OUT_PASSTHRU();
         break;
     }
     }
@@ -1697,6 +1815,58 @@ static SV *tpl_out_sv(pTHX_ tpl_compiled *t, const char *buf, STRLEN len) {
     if (utf8 && t->r_skipped && len) utf8 = is_utf8_string((const U8 *)buf, len);
     return newSVpvn_utf8(buf, len, utf8);
 }
+
+/* A field selector of the wrong kind for the template fetches nothing from any
+   row: the sort comes back in input order, skip_if never fires, and
+   skip_unless drops everything and returns "". saw_num_ref distinguishes
+   "ROW_ARRAY because {0} was seen" from "ROW_ARRAY because there are no field
+   references at all", where either kind is meaningless and neither is refused.
+   `own` is the template when nothing owns it yet: new() and clone() check after
+   tpl_compile built it, so croaking without freeing would strand it.
+   render_sorted passes NULL -- by then the object owns it. */
+#define TS_CHECK_KIND(own, what, by_name) STMT_START { \
+    if ((by_name) && t->saw_num_ref) { \
+        if (own) tpl_free(own); \
+        croak("Text::Stencil: %s was given a field name but the template uses" \
+              " numeric field references", (what)); \
+    } \
+    if (!(by_name) && t->mode == ROW_HASH) { \
+        if (own) tpl_free(own); \
+        croak("Text::Stencil: %s was given a column index but the template uses" \
+              " named field references", (what)); \
+    } \
+} STMT_END
+#define TS_CHECK_SORT_KIND(by_name) TS_CHECK_KIND(NULL, "render_sorted", (by_name))
+
+/* Fetch row i, or decide why the slot is empty. A slot past the end means
+   user code shrank the array mid-render, so the caller stops; within the
+   array it is a hole, which Perl reads as undef and which renders as an empty
+   row like any other non-arrayref. Only consulted when the slot is empty, so
+   the common path is free. Returns 0 to tell the caller to stop. */
+PERL_STATIC_INLINE int ts_row_at(pTHX_ AV *rows, SSize_t i, SV **out) {
+    SV **rowref = av_fetch(rows, i, 0);
+    if (LIKELY(rowref && *rowref)) { *out = *rowref; return 1; }
+    if (i > av_top_index(rows)) return 0;
+    *out = &PL_sv_undef;
+    return 1;
+}
+
+/* Emit one row through the compiled ops. */
+#define TS_EMIT_OPS(row_sv, idx) do { \
+    for (int j_ = 0; j_ < t->nops; j_++) { \
+        tpl_op *op_ = &t->ops[j_]; \
+        if (op_->static_data) BUF_WRITE(op_->static_data, op_->static_len); \
+        else render_field(aTHX_ t, op_, (row_sv), &buf, &pos, &alloc, (idx)); \
+    } \
+} while (0)
+
+/* Write straight to the render buffer and hand the moved pointers back. The
+   four fast-path exits in render_field all did this by hand. */
+#define EMIT_DIRECT(s, n) do { \
+    char *buf = *bufp; STRLEN pos = *posp; STRLEN alloc = *allocp; \
+    BUF_ENSURE(n); memcpy(buf + pos, (s), (n)); pos += (n); \
+    *bufp = buf; *posp = pos; *allocp = alloc; \
+} while (0)
 
 static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
                           char **bufp, STRLEN *posp, STRLEN *allocp,
@@ -1761,13 +1931,14 @@ static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
             STRLEN params_len = op->chain[0].param_str_len;
             const char *p = params, *pe = params + params_len;
             const char *last_param = NULL; STRLEN last_param_len = 0;
-            /* find last param (the literal default) */
-            const char *tp = params;
-            while (tp < pe) {
-                const char *next = memchr(tp, ':', pe - tp);
-                if (!next) { last_param = tp; last_param_len = pe - tp; break; }
-                last_param = tp; last_param_len = next - tp;
-                tp = next + 1;
+            /* The literal default is whatever follows the final ':', including
+               nothing. Walking forwards never visited the empty tail of
+               `coalesce:FIELD:`, so it stopped on FIELD and emitted that
+               field's NAME. Scanning back makes the tail empty by
+               construction. */
+            {   const char *q = pe;
+                while (q > params && q[-1] != ':') q--;
+                last_param = q; last_param_len = (STRLEN)(pe - q);
             }
             /* try each fallback field (all params except the last) */
             int found = 0;
@@ -1776,46 +1947,43 @@ static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
                 const char *next = memchr(p, ':', pe - p);
                 STRLEN seg_len = next ? (STRLEN)(next - p) : (STRLEN)(pe - p);
                 if (!next && p == last_param) break; /* this is the literal default */
-                /* check if this is not the last param */
-                if (p != last_param || next) {
-                    /* try to fetch this field from the row */
-                    tpl_op tmp_op = {0};
-                    if (mode == ROW_HASH) {
-                        tmp_op.key = (char *)p; tmp_op.key_len = seg_len;
-                        /* the fallback name is a slice of the template, so it
-                           carries the template's own encoding */
-                        tmp_op.key_utf8 = op->key_utf8;
-                    } else {
-                        int is_neg = 0, si = 0;
-                        if (seg_len > 0 && p[0] == '-') { is_neg = 1; si = 1; }
-                        int is_num = 1;
-                        for (STRLEN fi = si; fi < seg_len; fi++)
-                            if (p[fi] < '0' || p[fi] > '9') { is_num = 0; break; }
-                        if (is_num && seg_len > (STRLEN)si) {
-                            tmp_op.col = 0;
-                            {   /* bound it like parse_field_spec does: an unchecked
-                                   accumulate wrapped 2**32 onto a valid column */
-                                int ovf = 0;
-                                for (STRLEN fi = si; fi < seg_len; fi++) {
-                                    int d = p[fi] - '0';
-                                    if (tmp_op.col > (INT_MAX - d) / 10) { ovf = 1; break; }
-                                    tmp_op.col = tmp_op.col * 10 + d;
-                                }
-                                if (ovf) { if (!next) break; p = next + 1; continue; }
+                /* try to fetch this field from the row */
+                tpl_op tmp_op = {0};
+                if (mode == ROW_HASH) {
+                    tmp_op.key = (char *)p; tmp_op.key_len = seg_len;
+                    /* the fallback name is a slice of the template, so it
+                       carries the template's own encoding */
+                    tmp_op.key_utf8 = op->key_utf8;
+                } else {
+                    int is_neg = 0, si = 0;
+                    if (seg_len > 0 && p[0] == '-') { is_neg = 1; si = 1; }
+                    int is_num = 1;
+                    for (STRLEN fi = si; fi < seg_len; fi++)
+                        if (p[fi] < '0' || p[fi] > '9') { is_num = 0; break; }
+                    if (is_num && seg_len > (STRLEN)si) {
+                        tmp_op.col = 0;
+                        {   /* bound it like parse_field_spec does: an unchecked
+                               accumulate wrapped 2**32 onto a valid column */
+                            int ovf = 0;
+                            for (STRLEN fi = si; fi < seg_len; fi++) {
+                                int d = p[fi] - '0';
+                                if (tmp_op.col > (INT_MAX - d) / 10) { ovf = 1; break; }
+                                tmp_op.col = tmp_op.col * 10 + d;
                             }
-                            if (is_neg) tmp_op.col = -tmp_op.col;
-                        } else {
-                            if (!next) break; /* non-numeric in array mode = treat as literal default */
-                            p = next + 1; continue;
+                            if (ovf) { if (!next) break; p = next + 1; continue; }
                         }
+                        if (is_neg) tmp_op.col = -tmp_op.col;
+                    } else {
+                        if (!next) break; /* non-numeric in array mode = treat as literal default */
+                        p = next + 1; continue;
                     }
-                    SV *fallback = fetch_field(aTHX_ row_sv, &tmp_op, mode);
-                    if (fallback && SvOK(fallback)) {
-                        STRLEN flen;
-                        const char *fstr = SvPV_nomg(fallback, flen);
-                        if (flen > 0) { sv = fallback; src = fstr; slen = flen; use_default = 0; found = 1;
-                                        TS_NOTE_SV(t, fallback, src, slen); break; }
-                    }
+                }
+                SV *fallback = fetch_field(aTHX_ row_sv, &tmp_op, mode);
+                if (fallback && SvOK(fallback)) {
+                    STRLEN flen;
+                    const char *fstr = SvPV_nomg(fallback, flen);
+                    if (flen > 0) { sv = fallback; src = fstr; slen = flen; use_default = 0; found = 1;
+                                    TS_NOTE_SV(t, fallback, src, slen); break; }
                 }
                 if (!next) break;
                 p = next + 1;
@@ -1844,9 +2012,7 @@ static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
         }
         int clen = itoa_fast(cbuf, cnt);
         if (op->chain_len == 1) {
-            char *buf = *bufp; STRLEN pos = *posp; STRLEN alloc = *allocp;
-            BUF_ENSURE(clen); memcpy(buf + pos, cbuf, clen); pos += clen;
-            *bufp = buf; *posp = pos; *allocp = alloc;
+            EMIT_DIRECT(cbuf, clen);
             return;
         }
         src = cbuf; slen = clen;
@@ -1859,9 +2025,7 @@ static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
         if (op->chain_len > 0 && (op->chain[0].type == XF_INT || op->chain[0].type == XF_INT_COMMA)) {
             int ilen = (op->chain[0].type == XF_INT) ? itoa_fast(ibuf, SvIV_nomg(sv)) : itoa_comma(ibuf, SvIV_nomg(sv));
             if (op->chain_len == 1) {
-                char *buf = *bufp; STRLEN pos = *posp; STRLEN alloc = *allocp;
-                BUF_ENSURE(ilen); memcpy(buf + pos, ibuf, ilen); pos += ilen;
-                *bufp = buf; *posp = pos; *allocp = alloc;
+                EMIT_DIRECT(ibuf, ilen);
                 return;
             }
             src = ibuf; slen = ilen;
@@ -1871,9 +2035,7 @@ static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
                                 op->chain[0].param_int, (double)SvNV_nomg(sv));
             if (flen > TS_FLTSZ - 1) flen = TS_FLTSZ - 1;
             if (op->chain_len == 1) {
-                char *buf = *bufp; STRLEN pos = *posp; STRLEN alloc = *allocp;
-                BUF_ENSURE(flen); memcpy(buf + pos, fbuf, flen); pos += flen;
-                *bufp = buf; *posp = pos; *allocp = alloc;
+                EMIT_DIRECT(fbuf, flen);
                 return;
             }
             src = fbuf; slen = flen;
@@ -1913,6 +2075,13 @@ static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
          op->chain[0].type == XF_FLOAT || op->chain[0].type == XF_COUNT ||
          op->chain[0].type == XF_COALESCE))
         start = 1;
+    /* use_default skipped the count handler, and apply_xform then wrote 0 over
+       the value default had supplied: {items:count|default:none} on a missing
+       field printed 0. count on undef is empty, so drop the stage. The rownum
+       is a scalar, where 0 is right, so leave {#:count} alone. */
+    if (use_default && !op->is_rownum && op->chain_len > 0 &&
+        op->chain[0].type == XF_COUNT)
+        start = 1;
 
     /* the overwhelmingly common shape: one transform, and it emits */
     if (op->chain_len - start == 1 && op->chain[start].type != XF_DEFAULT) {
@@ -1931,9 +2100,7 @@ static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
         if (op->chain[i].type != XF_DEFAULT) { if (!effective) only = &op->chain[i]; effective++; }
 
     if (effective == 0) {
-        char *buf = *bufp; STRLEN pos = *posp; STRLEN alloc = *allocp;
-        BUF_ENSURE(slen); memcpy(buf + pos, src, slen); pos += slen;
-        *bufp = buf; *posp = pos; *allocp = alloc;
+        EMIT_DIRECT(src, slen);
         return;
     }
 
@@ -1944,17 +2111,26 @@ static void render_field(pTHX_ tpl_compiled *t, tpl_op *op, SV *row_sv,
         return;
     }
 
-    /* chain: apply transforms with ping-pong buffers */
+    /* chain: apply transforms with ping-pong buffers.
+       Deliberate gap: plain malloc, not savestack-tracked, so a croak before
+       the free below leaks the block apply_xform is growing -- likewise
+       sprintf's sv_heap. Only the "out of memory" croaks reach either window
+       on 64-bit and no user code runs there; plugging it costs a signature
+       change plus stores in the per-stage loop. Revisit if a transform ever
+       grows a croak of its own. */
     char *tmp_a = NULL, *tmp_b = NULL;
     STRLEN tmp_a_len = 0, tmp_a_alloc = 0, tmp_b_len = 0, tmp_b_alloc = 0;
     const char *cur = src; STRLEN cur_len = slen;
     int use_a = 1;
 
+    /* which stage emits: found once here rather than rescanned per stage */
+    int last_eff = -1;
+    for (int i = start; i < op->chain_len; i++)
+        if (op->chain[i].type != XF_DEFAULT) last_eff = i;
+
     for (int i = start; i < op->chain_len; i++) {
         if (op->chain[i].type == XF_DEFAULT) continue;
-        int is_last = 1;
-        for (int k = i + 1; k < op->chain_len; k++)
-            if (op->chain[k].type != XF_DEFAULT) { is_last = 0; break; }
+        int is_last = (i == last_eff);
 
         if (is_last) {
             char *dummy = NULL; STRLEN dummy_len = 0, dummy_alloc = 0;
@@ -2004,7 +2180,11 @@ static int is_field_truthy(pTHX_ SV *row_sv, tpl_compiled *t, int is_skip_if) {
     }
     if (!field || !SvOK(field)) return 0;
     STRLEN flen;
-    const char *fstr = SvPV(field, flen);
+    /* get-magic already ran above, on both branches. Plain SvPV re-ran it, and
+       a tied element's second FETCH can differ -- the skip decision was taken
+       on a value nothing else in the render sees. fetch_field is spelled the
+       same way. */
+    const char *fstr = SvPV_nomg(field, flen);
     if (flen == 0) return 0;
     if (flen == 1 && fstr[0] == '0') return 0;
     return 1;
@@ -2029,22 +2209,13 @@ static SV *tpl_render(pTHX_ tpl_compiled *t, AV *rows) {
     BUF_WRITE(t->header, t->header_len);
     int first = 1;
     for (SSize_t i = 0; i < nrows; i++) {
-        SV **rowref = av_fetch(rows, i, 0);
-        if (!rowref || !*rowref) continue;
-        /* pin the row: rendering it runs Perl (tie, overload, DESTROY) that can
-           clear this slot or realloc AvARRAY, leaving *rowref dangling */
-        SV *row_sv = *rowref;
-        sv_2mortal(SvREFCNT_inc_simple_NN(row_sv));
+        SV *row_sv;
+        if (!ts_row_at(aTHX_ rows, i, &row_sv)) break;
+        TS_PIN_ROW(row_sv);
         if (should_skip_row(aTHX_ row_sv, t)) continue;
         if (!first && t->sep_len) BUF_WRITE(t->sep, t->sep_len);
         first = 0;
-        for (int j = 0; j < t->nops; j++) {
-            tpl_op *op = &t->ops[j];
-            if (op->static_data)
-                BUF_WRITE(op->static_data, op->static_len);
-            else
-                render_field(aTHX_ t, op, row_sv, &buf, &pos, &alloc, i);
-        }
+        TS_EMIT_OPS(row_sv, i);
     }
     t->last_row_count = nrows;
     BUF_WRITE(t->footer, t->footer_len);
@@ -2089,12 +2260,14 @@ typedef struct {
 static int sort_cmp_multi(const sort_entry *ea, const sort_entry *eb) {
     for (int k = 0; k < ea->nsort; k++) {
         if (ea->numeric) {
-            char ba[64], bb[64];
-            int la = ea->key_lens[k] < 63 ? (int)ea->key_lens[k] : 63;
-            int lb = eb->key_lens[k] < 63 ? (int)eb->key_lens[k] : 63;
-            memcpy(ba, ea->keys[k], la); ba[la] = 0;
-            memcpy(bb, eb->keys[k], lb); bb[lb] = 0;
-            double da = atof(ba), db = atof(bb);
+            double da = ts_atof(ea->keys[k], ea->key_lens[k]);
+            double db = ts_atof(eb->keys[k], eb->key_lens[k]);
+            /* NaN is neither < nor > anything, so it compared equal to every
+               key and the comparator stopped being a weak ordering: garbage
+               order, plus an out-of-bounds read in glibc qsort before 2.39.
+               Treat it as the zero other unparseable values become. */
+            if (UNLIKELY(da != da)) da = 0;
+            if (UNLIKELY(db != db)) db = 0;
             if (da < db) return -1;
             if (da > db) return 1;
         } else {
@@ -2159,11 +2332,10 @@ static SV *tpl_render_sorted(pTHX_ tpl_compiled *t, AV *rows,
         /* a magical rows array yields unmaterialised PVLVs, and the SvROK test
            below would leave every sort key empty */
         if (rowref) SvGETMAGIC(*rowref);
-        /* Pin the row and every key SV: collecting one row's key can run Perl
-           (tie, overload) that frees an earlier row, and the comparator reads
-           those PVs long afterwards -- that was a use-after-free in qsort. */
+        /* the comparator reads these PVs long after collection, so the key SVs
+               below must outlive it too -- that was a use-after-free in qsort */
         SV *row_sv = (rowref && *rowref) ? *rowref : &PL_sv_undef;
-        sv_2mortal(SvREFCNT_inc_simple_NN(row_sv));
+        TS_PIN_ROW(row_sv);
         entries[i].sv = row_sv;
         entries[i].keys = all_keys + i * nsort;
         entries[i].key_lens = all_lens + i * nsort;
@@ -2237,11 +2409,7 @@ static SV *tpl_render_sorted(pTHX_ tpl_compiled *t, AV *rows,
         if (should_skip_row(aTHX_ row_sv, t)) continue;
         if (!first && t->sep_len) BUF_WRITE(t->sep, t->sep_len);
         first = 0;
-        for (int j = 0; j < t->nops; j++) {
-            tpl_op *op = &t->ops[j];
-            if (op->static_data) BUF_WRITE(op->static_data, op->static_len);
-            else render_field(aTHX_ t, op, row_sv, &buf, &pos, &alloc, i);
-        }
+        TS_EMIT_OPS(row_sv, i);
     }
     t->last_row_count = nrows;
     BUF_WRITE(t->footer, t->footer_len);
@@ -2255,10 +2423,7 @@ static SV *tpl_render_sorted(pTHX_ tpl_compiled *t, AV *rows,
 
 static SV *tpl_render_one(pTHX_ tpl_compiled *t, SV *row_sv) {
     TS_ENC_ENTER(t);
-    /* pin the row like the other render paths do: skip tests and field
-       rendering both run Perl (tie, overload) that can drop the caller's last
-       reference, and perl would hand the freed head straight back out */
-    sv_2mortal(SvREFCNT_inc_simple_NN(row_sv));
+    TS_PIN_ROW(row_sv);
     if (should_skip_row(aTHX_ row_sv, t)) {
         TS_ENC_LEAVE(t);   /* a skipped row must not eat an outer render's state */
         return newSVpvn("", 0);
@@ -2268,11 +2433,7 @@ static SV *tpl_render_one(pTHX_ tpl_compiled *t, SV *row_sv) {
     RBUF_INIT(t, t->header_len + t->footer_len + 512);
     TS_INFLIGHT_ARM(t);
     BUF_WRITE(t->header, t->header_len);
-    for (int j = 0; j < t->nops; j++) {
-        tpl_op *op = &t->ops[j];
-        if (op->static_data) BUF_WRITE(op->static_data, op->static_len);
-        else render_field(aTHX_ t, op, row_sv, &buf, &pos, &alloc, 0);
-    }
+    TS_EMIT_OPS(row_sv, 0);
     BUF_WRITE(t->footer, t->footer_len);
     TS_INFLIGHT_DISARM(t);
     RBUF_FINISH(t);
@@ -2288,7 +2449,7 @@ static void tpl_render_to_fh(pTHX_ tpl_compiled *t, AV *rows, PerlIO *fh) {
        resident -- sizing it from the row count made a million-row render
        reserve hundreds of MB and hit an address-space limit that render_cb,
        which uses a fixed buffer, sails through. */
-    STRLEN est = t->header_len + t->footer_len + nrows * 300 + 1;
+    STRLEN est = ts_est(t->header_len + t->footer_len, nrows);
     STRLEN cap = t->header_len + t->footer_len + 65536 + 1;
     STRLEN alloc = est < cap ? est : cap;
     char *buf = (char *)malloc(alloc);
@@ -2298,20 +2459,13 @@ static void tpl_render_to_fh(pTHX_ tpl_compiled *t, AV *rows, PerlIO *fh) {
     BUF_WRITE(t->header, t->header_len);
     int first = 1;
     for (SSize_t i = 0; i < nrows; i++) {
-        SV **rowref = av_fetch(rows, i, 0);
-        if (!rowref || !*rowref) continue;
-        /* pin the row: rendering it runs Perl (tie, overload, DESTROY) that can
-           clear this slot or realloc AvARRAY, leaving *rowref dangling */
-        SV *row_sv = *rowref;
-        sv_2mortal(SvREFCNT_inc_simple_NN(row_sv));
+        SV *row_sv;
+        if (!ts_row_at(aTHX_ rows, i, &row_sv)) break;
+        TS_PIN_ROW(row_sv);
         if (should_skip_row(aTHX_ row_sv, t)) continue;
         if (!first && t->sep_len) BUF_WRITE(t->sep, t->sep_len);
         first = 0;
-        for (int j = 0; j < t->nops; j++) {
-            tpl_op *op = &t->ops[j];
-            if (op->static_data) BUF_WRITE(op->static_data, op->static_len);
-            else render_field(aTHX_ t, op, row_sv, &buf, &pos, &alloc, i);
-        }
+        TS_EMIT_OPS(row_sv, i);
         if (pos > 65536) { FH_WRITE(fh, buf, pos); pos = 0; }
     }
     t->last_row_count = nrows;
@@ -2336,9 +2490,9 @@ static SV *tpl_render_cb(pTHX_ tpl_compiled *t, SV *cb, PerlIO *fh) {
         RBUF_INIT(t, 4096);
     }
     TS_INFLIGHT_ARM(t);
-    /* Where our savestack frame starts.  A callback that leaves non-locally
-       (last/goto out of the sub) makes perl unwind past this before G_EVAL
-       hands control back to us, so this is how we notice. */
+    /* Where our savestack frame starts.  Nothing should reach it now that the
+       callback runs on its own stackinfo, but a mis-guessed unwind here costs
+       a heap corruption, so the check stays as a backstop. */
     I32 ts_floor = PL_savestack_ix;
     pos = 0;
 
@@ -2347,17 +2501,29 @@ static SV *tpl_render_cb(pTHX_ tpl_compiled *t, SV *cb, PerlIO *fh) {
     int first = 1;
     t->last_row_count = 0;
 
+    /* Run the callback on a stackinfo of its own. last/next/goto out of a sub
+       unwinds by scanning the current stackinfo's context stack; without this
+       it walks straight through our C frame, panicking in pp_iter or resuming
+       in our caller with the render half-done. A fresh stackinfo has no context
+       to find, so the jump becomes a "Label not found" die that G_EVAL catches.
+       Core contains a user sub called from C the same way (magic_methcall,
+       amagic_call, the warn hook). Hoisted out of the loop: per-iteration it
+       costs ~5%, here one push per render_cb call. */
+    dSP;
+    PUSHSTACKi(PERLSI_MAGIC);
+
     while (1) {
-        dSP;
+        SPAGAIN;
         ENTER; SAVETMPS;
         PUSHMARK(SP);
         PUTBACK;
         int count = call_sv(cb, G_SCALAR | G_EVAL);
         SPAGAIN;
-        /* The callback left non-locally: our frame is already gone, so the
-           buffer has been reclaimed and `buf` dangles.  Touching it -- or even
-           running LEAVE -- would corrupt the heap or over-pop the savestack.
-           Return and let perl finish the unwind it started. */
+        /* Backstop: the stackinfo above contains the jumps that used to get
+           here. If it ever fires our frame is already gone and `buf` dangles,
+           so touching it -- or running LEAVE -- would corrupt the heap. Return
+           and let perl finish its unwind; the stackinfo is left for die_unwind,
+           since getting here means perl is already mid-longjmp. */
         if (UNLIKELY(PL_savestack_ix < ts_floor)) return &PL_sv_undef;
         if (SvTRUE(ERRSV)) {
             /* The row callback died: free our render buffer (the fh path's
@@ -2365,6 +2531,7 @@ static SV *tpl_render_cb(pTHX_ tpl_compiled *t, SV *cb, PerlIO *fh) {
                a dying callback can't leak it. */
             SV *err = newSVsv(ERRSV);
             PUTBACK; FREETMPS; LEAVE;
+            POPSTACK;
             TS_INFLIGHT_DISARM(t);
             free(buf);
             croak_sv(sv_2mortal(err));
@@ -2390,17 +2557,15 @@ static SV *tpl_render_cb(pTHX_ tpl_compiled *t, SV *cb, PerlIO *fh) {
         if (!should_skip_row(aTHX_ row_sv, t)) {
             if (!first && t->sep_len) BUF_WRITE(t->sep, t->sep_len);
             first = 0;
-            for (int j = 0; j < t->nops; j++) {
-                tpl_op *op = &t->ops[j];
-                if (op->static_data) BUF_WRITE(op->static_data, op->static_len);
-                else render_field(aTHX_ t, op, row_sv, &buf, &pos, &alloc, row_idx);
-            }
+            TS_EMIT_OPS(row_sv, row_idx);
             if (use_fh && pos > 65536) { FH_WRITE(fh, buf, pos); pos = 0; }
         }
         LEAVE;
         row_idx++;
         t->last_row_count = row_idx;
     }
+
+    POPSTACK;
 
     t->last_row_count = row_idx;
     BUF_WRITE(t->footer, t->footer_len);
@@ -2413,7 +2578,7 @@ static SV *tpl_render_cb(pTHX_ tpl_compiled *t, SV *cb, PerlIO *fh) {
         return &PL_sv_undef;
     } else {
         TS_INFLIGHT_DISARM(t);
-    RBUF_FINISH(t);
+        RBUF_FINISH(t);
         { SV *res_ = tpl_out_sv(aTHX_ t, buf, pos); TS_ENC_LEAVE(t); return res_; }
     }
 }
@@ -2470,6 +2635,10 @@ CODE:
         row = ts_own_pv(aTHX_ ST(1), &rlen, NULL);
         if (SvUTF8(ST(1))) tpl_utf8 |= TS_TPL_ROW;
     } else {
+    /* one argument that is not a plain string is neither shorthand nor an
+       option list; "odd number of arguments" described the wrong mistake */
+    if (items == 2) croak("Text::Stencil: new takes a template string or an"
+                          " option list");
     if (items % 2 == 0) croak("Text::Stencil: odd number of arguments");
     for (int i = 1; i < items; i += 2) {
         const char *key = SvPV_nolen(ST(i));
@@ -2487,6 +2656,11 @@ CODE:
             if (el != 1)
                 croak("Text::Stencil: escape_char must be a single byte, got %" UVuf,
                       (UV)el);
+            /* a NUL fell through the `esc_char ? esc_char : '{'` default below
+               and silently meant '{', which is the quiet no-op this option's
+               single-byte check exists to prevent */
+            if (ev[0] == '\0')
+                croak("Text::Stencil: escape_char must not be NUL");
             esc = ev[0];
         }
         else if (strcmp(key, "skip_if") == 0) skip_if_sv = val;
@@ -2506,40 +2680,35 @@ CODE:
     if (skip_if_sv) {
         if (SvIOK(skip_if_sv) || looks_like_number(skip_if_sv)) {
             skip_if_isnum = 1;
-            skip_if_col = ts_col_sv(aTHX_ skip_if_sv, "skip_if", NULL);
+            skip_if_col = ts_col_sv(aTHX_ skip_if_sv, "skip_if");
         } else skip_if_ks = ts_own_pv(aTHX_ skip_if_sv, &skip_if_kl, &skip_if_u);
     }
     if (skip_unless_sv) {
         if (SvIOK(skip_unless_sv) || looks_like_number(skip_unless_sv)) {
             skip_unless_isnum = 1;
-            skip_unless_col = ts_col_sv(aTHX_ skip_unless_sv, "skip_unless", NULL);
+            skip_unless_col = ts_col_sv(aTHX_ skip_unless_sv, "skip_unless");
         } else skip_unless_ks = ts_own_pv(aTHX_ skip_unless_sv, &skip_unless_kl, &skip_unless_u);
     }
 
     tpl_compiled *t = tpl_compile(aTHX_ header, hlen, row, rlen, footer, flen, sep, slen, esc, tpl_utf8, err);
-    if (err[0]) { if (t) tpl_free(t); croak("Text::Stencil: %s", err); }
+    if (!t || err[0]) { if (t) tpl_free(t); croak("Text::Stencil: %s", err); }
     if (skip_if_sv) {
+        TS_CHECK_KIND(t, "skip_if", !skip_if_isnum);
         t->has_skip_if = 1;
         if (skip_if_isnum) t->skip_if_col = skip_if_col;
         else {
-            t->skip_if_key = (char *)malloc(skip_if_kl + 1);
-            if (!t->skip_if_key) { tpl_free(t); croak("Text::Stencil: out of memory"); }
-            memcpy(t->skip_if_key, skip_if_ks, skip_if_kl);
-            t->skip_if_key[skip_if_kl] = '\0';
-            t->skip_if_key_len = skip_if_kl;
-            t->skip_if_utf8 = skip_if_u;
+            ts_set_skip_key(aTHX_ t, &t->skip_if_key, &t->skip_if_key_len,
+                            &t->skip_if_utf8, skip_if_ks, skip_if_kl, skip_if_u);
         }
     }
     if (skip_unless_sv) {
+        TS_CHECK_KIND(t, "skip_unless", !skip_unless_isnum);
         t->has_skip_unless = 1;
         if (skip_unless_isnum) t->skip_unless_col = skip_unless_col;
         else {
-            t->skip_unless_key = (char *)malloc(skip_unless_kl + 1);
-            if (!t->skip_unless_key) { tpl_free(t); croak("Text::Stencil: out of memory"); }
-            memcpy(t->skip_unless_key, skip_unless_ks, skip_unless_kl);
-            t->skip_unless_key[skip_unless_kl] = '\0';
-            t->skip_unless_key_len = skip_unless_kl;
-            t->skip_unless_utf8 = skip_unless_u;
+            ts_set_skip_key(aTHX_ t, &t->skip_unless_key, &t->skip_unless_key_len,
+                            &t->skip_unless_utf8, skip_unless_ks, skip_unless_kl,
+                            skip_unless_u);
         }
     }
     SV *obj = newSViv(PTR2IV(t));
@@ -2648,6 +2817,7 @@ CODE:
                               "indices and field names");
                 }
             }
+            TS_CHECK_SORT_KIND(use_keys);
             if (use_keys) {
                 const char **skeys = (const char **)malloc(nsort * sizeof(char *));
                 STRLEN *sklens = (STRLEN *)malloc(nsort * sizeof(STRLEN));
@@ -2683,17 +2853,19 @@ CODE:
                 SAVEDESTRUCTOR_X(ts_free, scols);
                 for (int i = 0; i < nsort; i++) {
                     SV **el = av_fetch(sort_av, i, 0);
-                    scols[i] = el ? ts_col_sv(aTHX_ *el, "sort", NULL) : 0;
+                    scols[i] = el ? ts_col_sv(aTHX_ *el, "sort") : 0;
                 }
                 RETVAL = tpl_render_sorted(aTHX_ t, rows, scols, NULL, NULL, NULL, nsort, descending, numeric);
             }
         }
     } else if (SvIOK(sort_by) || looks_like_number(sort_by)) {
-        int col = ts_col_sv(aTHX_ sort_by, "sort", NULL);
+        TS_CHECK_SORT_KIND(0);
+        int col = ts_col_sv(aTHX_ sort_by, "sort");
         RETVAL = tpl_render_sorted(aTHX_ t, rows, &col, NULL, NULL, NULL, 1, descending, numeric);
     } else {
         STRLEN klen;
         int kutf8;
+        TS_CHECK_SORT_KIND(1);
         const char *key = ts_own_pv(aTHX_ sort_by, &klen, &kutf8);
         if (klen > 1 && key[0] == '-') { key++; klen--; descending = 1; }
         RETVAL = tpl_render_sorted(aTHX_ t, rows, NULL, &key, &klen, &kutf8, 1, descending, numeric);
@@ -2732,6 +2904,9 @@ render_cb(self, cb, ...)
 CODE:
 {
     tpl_compiled *t = TS_PIN_SELF(self);
+    /* like render_sorted: a silently swallowed extra argument is how a typo
+       becomes output nobody can explain */
+    if (items > 3) croak("Text::Stencil: render_cb takes at most two arguments");
     if (!SvROK(cb) || SvTYPE(SvRV(cb)) != SVt_PVCV)
         croak("Text::Stencil: render_cb second argument must be a coderef");
     PerlIO *fh = NULL;
@@ -2806,25 +2981,25 @@ CODE:
         orig->footer, orig->footer_len,
         sep ? sep : orig->sep, sep ? slen : orig->sep_len,
         orig->escape_char, tpl_utf8, err);
-    if (err[0]) { if (t) tpl_free(t); croak("Text::Stencil: %s", err); }
-    /* copy skip conditions from original */
+    if (!t || err[0]) { if (t) tpl_free(t); croak("Text::Stencil: %s", err); }
+    /* Copy the skip conditions -- but a replacement row can change the row
+       mode, leaving an inherited skip of the wrong kind fetching nothing from
+       any row. Re-check against the template we just built, as new() does. */
+    if (orig->has_skip_if)     TS_CHECK_KIND(t, "skip_if", orig->skip_if_key != NULL);
+    if (orig->has_skip_unless) TS_CHECK_KIND(t, "skip_unless", orig->skip_unless_key != NULL);
     t->has_skip_if = orig->has_skip_if;
     t->skip_if_col = orig->skip_if_col;
     if (orig->skip_if_key) {
-        t->skip_if_key = (char *)malloc(orig->skip_if_key_len + 1);
-        if (!t->skip_if_key) { tpl_free(t); croak("Text::Stencil: out of memory"); }
-        memcpy(t->skip_if_key, orig->skip_if_key, orig->skip_if_key_len + 1);
-        t->skip_if_key_len = orig->skip_if_key_len;
-        t->skip_if_utf8 = orig->skip_if_utf8;
+        ts_set_skip_key(aTHX_ t, &t->skip_if_key, &t->skip_if_key_len,
+                        &t->skip_if_utf8, orig->skip_if_key,
+                        orig->skip_if_key_len, orig->skip_if_utf8);
     }
     t->has_skip_unless = orig->has_skip_unless;
     t->skip_unless_col = orig->skip_unless_col;
     if (orig->skip_unless_key) {
-        t->skip_unless_key = (char *)malloc(orig->skip_unless_key_len + 1);
-        if (!t->skip_unless_key) { tpl_free(t); croak("Text::Stencil: out of memory"); }
-        memcpy(t->skip_unless_key, orig->skip_unless_key, orig->skip_unless_key_len + 1);
-        t->skip_unless_key_len = orig->skip_unless_key_len;
-        t->skip_unless_utf8 = orig->skip_unless_utf8;
+        ts_set_skip_key(aTHX_ t, &t->skip_unless_key, &t->skip_unless_key_len,
+                        &t->skip_unless_utf8, orig->skip_unless_key,
+                        orig->skip_unless_key_len, orig->skip_unless_utf8);
     }
     SV *obj = newSViv(PTR2IV(t));
     t->owner = obj;
@@ -2841,7 +3016,7 @@ DESTROY(self)
     SV *self
 CODE:
 {
-    MAGIC *mg = SvROK(self) ? mg_findext(SvRV(self), PERL_MAGIC_ext, &ts_vtbl) : NULL;
+    MAGIC *mg = TS_HAS_OUR_MAGIC(self);
     tpl_compiled *t = mg ? (tpl_compiled *)mg->mg_ptr : NULL;
     /* only the owner frees, and only once nothing is still inside a call */
     if (t && t->owner == SvRV(self)) {

@@ -1,10 +1,12 @@
 Revision history for Text::Stencil
 
-0.03  2026-08-04
+0.03  2026-08-05
     - Correctness and robustness fixes across compilation, rendering,
       transforms, encoding and I/O
-    - INCOMPATIBLE: templates 0.02 accepted but rendered wrong now fail to
-      compile
+    - INCOMPATIBLE: templates that were accepted but rendered wrong now fail
+      to compile; a field selector of the wrong kind for the template is an
+      error; a hole in the rows array renders as an empty row rather than
+      being skipped
 
 0.02  2026-06-01
     - Fix render-buffer use-after-free on croak

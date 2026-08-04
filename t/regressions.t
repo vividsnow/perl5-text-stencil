@@ -946,10 +946,8 @@ SKIP: {
 }
 
 {   # The supported ways to stop a render_cb stream. Leaving the callback with
-    # last/goto to an outer label is NOT among them: perl unwinds this frame
-    # before G_EVAL returns, and no state here is recoverable afterwards -- see
-    # the warning in the render_cb POD. That is a perl-level hazard the module
-    # cannot guard, so it is documented rather than asserted here.
+    # last/next/goto to an outer label is not among them, but it is contained
+    # rather than catastrophic now -- see the non-local-exit block below.
     my $s = Text::Stencil->new(row => '{0}|');
 
     my $n = 0;
@@ -968,6 +966,53 @@ SKIP: {
         my $out = $s->render_cb(sub { $j++ ? $stop : ['z'] });
         is $out, 'z|', 'a non-row return value stops the stream';
     }
+}
+
+{   # last/next/goto out of the callback unwound straight through our C frame:
+    # a pp_iter panic, or the caller resuming with the render half-done and a
+    # lexical clobbered (ASAN: heap overflow in Perl_pp_unstack). The callback
+    # now runs on its own stackinfo, so the jump becomes a catchable die.
+    # These assert the containment, not the wording perl chooses.
+    no warnings 'exiting';
+    my $s = Text::Stencil->new(row => '{0}|');
+
+    my ($n, $tail) = (0, 0);
+    my $e_last = exception_from(sub {
+        TS_NL1: for my $i (1 .. 3) {
+            $s->render_cb(sub { $n++ >= 2 ? (last TS_NL1) : [$n] });
+        }
+        $tail++;
+    });
+    like $e_last, qr/Label not found/, 'last out of the callback is a catchable die';
+    is $tail, 0, '  and the statement after the loop never runs';
+    is $n, 3, '  and the callback ran exactly as far as it should have';
+
+    ($n, $tail) = (0, 0);
+    my $e_next = exception_from(sub {
+        TS_NL2: for my $i (1 .. 3) {
+            $s->render_cb(sub { $n++ >= 2 ? (next TS_NL2) : [$n] });
+        }
+        $tail++;
+    });
+    like $e_next, qr/Label not found/, 'next out of the callback is a catchable die';
+    is $tail, 0, '  and it does not fall through either';
+
+    # goto: the failure that used to run the trailing statements twice
+    my $ran = 0;
+    my $e_goto = exception_from(sub {
+        my $k = 0;
+        $s->render_cb(sub { $k++ >= 2 ? (goto TS_NL3) : [$k] });
+        TS_NL3: $ran++;
+    });
+    like $e_goto, qr/label TS_NL3/i, 'goto out of the callback is a catchable die';
+    is $ran, 0, '  and the label body does not run at all';
+
+    # the object is still usable afterwards -- the unwind used to leave the
+    # render buffer armed and the next render tripped over it
+    my $m = 0;
+    is $s->render_cb(sub { $m < 2 ? [$m++] : undef }), '0|1|',
+        'the renderer still works after a contained non-local exit';
+    is $s->row_count, 2, '  with a correct row count';
 }
 
 {   # columns() built its keys with newSVpvn, dropping the UTF-8 flag that
@@ -1059,8 +1104,14 @@ SKIP: {
     # deciding how to numify the value are the same question, so they are asked
     # of one function -- when they were two, the value passed through here had
     # already been numified to 0 by the other one.
-    for my $n (60, 62, 64, 80) {
+    # 58 and 59 sit below the cutoff: without them the oracle's '0' arm never
+    # runs and the loop cannot tell the cutoff from "reject everything".
+    for my $n (58, 59, 60, 62, 64, 80) {
         my $long = '%' . ('-' x $n) . 'd';
+        # the 58/59 arms are the supported ones, so the module numifies 'abc'
+        # and perl warns exactly as its own sprintf "%d" would -- correct, but
+        # not worth two lines of stderr in every smoke report
+        no warnings 'numeric';
         my $got  = Text::Stencil->new(row => "{0:sprintf:$long}")->render([['abc']]);
         is $got, ($n + 2 >= 62 ? 'abc' : '0'),
             "a ${\($n + 2)}-character format is handled consistently";
@@ -1638,10 +1689,10 @@ SKIP: {
 
 {   # The sort-key fast path borrows each field's buffer while nothing in the
     # collection loop can re-enter perl. Deciding that from individual magic
-    # flavours was wrong three times over; the last was PERL_MAGIC_uvar, which
-    # hv_fetch dispatches on SvSMAGICAL && SvGMAGICAL and which is NOT
-    # RMAGICAL, so a uvar-magical row walked straight past the container guard
-    # and ran Perl with every earlier key still a borrowed pointer.
+    # flavours was wrong three times; the last was PERL_MAGIC_uvar, which
+    # hv_fetch dispatches on SvSMAGICAL && SvGMAGICAL and which is not
+    # RMAGICAL, so it walked past the container guard with every earlier key
+    # still borrowed.
     require Hash::Util::FieldHash;
     Hash::Util::FieldHash::fieldhashes(\my %fh);
     $fh{k} = 'mid';
@@ -1664,24 +1715,24 @@ SKIP: {
     # use-after-free.
     skip 'Variable::Magic not installed', 2 unless $TS_HAVE_VMAGIC;
 
-    our @TS_VM_ROWS;
-    my $wiz = Variable::Magic::wizard(fetch => sub {
-        %$_ = () for @TS_VM_ROWS;
-        my @churn = ('Q' x 300) x 200;
-        ();
-    });
-    my @plain = map { { a => ("row$_" x 20) } } 1 .. 6;
-    my %trigger = (a => 'trigger');
+    # Copied-vs-borrowed is observable without touching freed memory: let the
+    # wizard edit an earlier row's key in place (tr///, same length, and a
+    # runtime-built string so it is not COW). A copy sorts on the value as
+    # captured; a borrowed pointer sees the edit and sorts elsewhere.
+    our %TS_VM_ROW0;
+    { my $s = ''; $s .= 'a' for 1 .. 3; $TS_VM_ROW0{k} = $s; }
+    my $wiz = Variable::Magic::wizard(fetch => sub { $TS_VM_ROW0{k} =~ tr/a/z/; () });
+    my %trigger;
+    { my $s = ''; $s .= 'm' for 1 .. 3; $trigger{k} = $s; }
     # &-form: the prototype exists only when the module loaded, so calling
     # through it would change how this line parses depending on the machine
     &Variable::Magic::cast(\%trigger, $wiz);
-    @TS_VM_ROWS = @plain;
 
-    my $out = eval {
-        Text::Stencil->new(row => '[{a:raw}]')->render_sorted([@plain, \%trigger], 'a')
-    };
-    ok defined $out, 'a uvar wizard that frees the rows mid-collection does not crash';
-    ok length($out) >= 2, '  and still produces output';
+    my $out = Text::Stencil->new(row => '[{k}]')
+        ->render_sorted([\%TS_VM_ROW0, \%trigger, { k => 'ttt' }], 'k');
+    is $out, '[zzz][mmm][ttt]',
+        'a uvar row does not leave earlier sort keys borrowed';
+    is $TS_VM_ROW0{k}, 'zzz', '  (the wizard did edit the key in place)';
 }
 
 {   # Rejecting a bad scalar $sort_by left the arrayref form validating nothing,
@@ -1714,6 +1765,511 @@ SKIP: {
         '  and a plain column';
     like exception_from(sub { $h->render_sorted(\@r, [ ('n') x 1025 ]) }),
         qr/too many fields/, 'an absurd number of sort fields is rejected';
+}
+
+{   # The digit-taker bounded each step against a worst-case 9 instead of the
+    # digit in hand, so the top eight magnitudes of the IV range saturated
+    # although they fit. Mid-chain and first-position must agree throughout.
+    for my $off (0 .. 12) {
+        for my $iv (9223372036854775807 - $off, -9223372036854775808 + $off) {
+            my $s = "$iv";
+            is +Text::Stencil->new(row => '{0:raw|int}')->render_one([$s]),
+               +Text::Stencil->new(row => '{0:int}')->render_one([$s]),
+               "mid-chain int agrees with first-position int on $s";
+        }
+    }
+    # saturation and digit-scraping must be untouched
+    is +Text::Stencil->new(row => '{0:raw|int}')->render_one(['9' x 25]),
+        '9223372036854775807', 'a value past IV_MAX still saturates';
+    is +Text::Stencil->new(row => '{0:raw|int}')->render_one(['-' . '9' x 25]),
+        '-9223372036854775808', '  and past IV_MIN';
+    is +Text::Stencil->new(row => '{0:raw|int}')->render_one(['a1b2c3']), '123',
+        '  and digit scraping still works';
+}
+
+{   # Deferred items, now done. Each was a silent no-op or an inconsistency of
+    # the same class the module rejects elsewhere.
+
+    # a parameter on a transform that takes none was dropped on the floor
+    for my $spec (qw(uc:1 lc:x html:5 hex:9 int:3 trim:z json:2 length:4 base64:7)) {
+        like exception_from(sub { Text::Stencil->new(row => "{0:$spec}") }),
+            qr/takes no parameter/, "{0:$spec} is refused rather than ignored";
+    }
+    # A trailing delimiter is tolerated -- the segment loop ends at the final
+    # separator so there is no empty segment to reject -- but an empty segment
+    # anywhere else is an error. Undocumented until now; pinned so the two
+    # halves cannot drift apart.
+    is +Text::Stencil->new(row => '{0:trim|}')->render_one([' x ']), 'x',
+        'a trailing | is ignored, like a trailing :';
+    is +Text::Stencil->new(row => '{0:}')->render_one([' x ']), ' x ',
+        '  and a trailing : still is';
+    is +Text::Stencil->new(row => '{0|}')->render_one([' x ']), ' x ',
+        '  including on a bare field';
+    like exception_from(sub { Text::Stencil->new(row => '{0:|trim}') }),
+        qr/empty transform in chain/, '  but a leading empty segment is an error';
+    like exception_from(sub { Text::Stencil->new(row => '{0:trim||}') }),
+        qr/empty transform in chain/, '  and an interior one';
+
+    # int hands an infinite value to the platform's IV conversion rather than
+    # printing "Inf" the way perl's %d does. What that conversion produces
+    # varies by perl version -- 5.26/5.30/5.34 disagree with 5.38+ -- so pin
+    # only that it is an integer and does not crash, not which one.
+    like +Text::Stencil->new(row => '{0:int}')->render_one(['inf']), qr/^-?\d+$/,
+        'an infinite value yields some integer rather than "Inf"';
+    is +Text::Stencil->new(row => '{0:int}')->render_one(['nan']), '0',
+        '  and NaN is the zero junk already becomes';
+
+    # An unknown name leaves the type at its XF_RAW initialiser, which no
+    # branch of the parameter chain claims -- so a misspelled transform WITH a
+    # parameter fell into the no-parameter error and got told it takes none.
+    # Worse, that hard error preempted the deferred one, and a stray literal
+    # brace lost the mixed-mode message that explains it properly.
+    like exception_from(sub { Text::Stencil->new(row => '{0:trnuc:80}') }),
+        qr/unknown transform 'trnuc'/,
+        'a misspelled transform with a parameter is still "unknown transform"';
+    like exception_from(sub { Text::Stencil->new(row => '{0} .a { color: red; x: y }') }),
+        qr/mixes numeric .* named .*literal delimiter/s,
+        '  and a stray literal brace still gets the mixed-mode explanation';
+
+    # ...but every transform that does take one still does
+    for my $spec ('pad:6', 'trunc:4', 'float:2', 'sprintf:%d', 'replace:a:b',
+                  'mask:2', 'substr:1:2', 'default:D', 'bool:Y:N', 'if:X',
+                  'unless:X', 'map:a=A', 'wrap:[:]', 'coalesce:1:D', 'date:%Y',
+                  'plural:item') {
+        ok eval { Text::Stencil->new(row => "{0:$spec}"); 1 }, "  {0:$spec} still compiles";
+    }
+    # and the bare forms are untouched
+    ok eval { Text::Stencil->new(row => '{0:uc}{1:html}{2:count}'); 1 },
+        '  bare parameterless transforms still compile';
+
+    # a sort spec of the wrong kind fetched nothing and returned input order
+    my $arr = Text::Stencil->new(row => '{0}/');
+    my $hash = Text::Stencil->new(row => '{n}/');
+    for my $spec ('name', ['name']) {
+        like exception_from(sub { $arr->render_sorted([['c'],['a']], $spec) }),
+            qr/given a field name but the template uses numeric/,
+            'a name spec against a numeric template croaks';
+    }
+    for my $spec (5, [5]) {
+        like exception_from(sub { $hash->render_sorted([{n=>'c'},{n=>'a'}], $spec) }),
+            qr/given a column index but the template uses named/,
+            'a numeric spec against a named template croaks';
+    }
+    is $arr->render_sorted([['c'],['a']], 0), 'a/c/', '  matching specs still sort';
+    is $hash->render_sorted([{n=>'c'},{n=>'a'}], 'n'), 'a/c/', '  both ways';
+    is $hash->render_sorted([{n=>'c'},{n=>'a'}], '-n'), 'c/a/', '  including -name';
+    # a template with no field refs at all is ambiguous, so neither is refused
+    my $none = Text::Stencil->new(row => 'lit/');
+    ok eval { $none->render_sorted([{n=>1}], 'n'); $none->render_sorted([[1]], 0); 1 },
+        '  a template with no field references accepts either kind';
+
+    # The sort spec got a kind check; the skip conditions are the same mistake
+    # and did not. A numeric skip against a named template (or the reverse)
+    # fetches nothing from any row, so skip_if never fires and skip_unless
+    # drops every row and hands back an empty string.
+    like exception_from(sub { Text::Stencil->new(row => '[{name}]', skip_unless => 0) }),
+        qr/skip_unless was given a column index but the template uses named/,
+        'a numeric skip_unless against a named template croaks';
+    like exception_from(sub { Text::Stencil->new(row => '[{0}]', skip_unless => 'flag') }),
+        qr/skip_unless was given a field name but the template uses numeric/,
+        '  and a named one against a numeric template';
+    like exception_from(sub { Text::Stencil->new(row => '[{name}]', skip_if => 0) }),
+        qr/skip_if was given a column index/, '  skip_if too';
+    # clone can change the row mode, so it has to re-check what it inherits
+    like exception_from(sub { Text::Stencil->new(row => '[{0}]', skip_if => 1)
+                                  ->clone(row => '[{name}]') }),
+        qr/skip_if was given a column index/,
+        '  and clone re-checks an inherited skip against the new row mode';
+    # matching kinds, and a template with no field refs, are untouched
+    is +Text::Stencil->new(row => '[{0}]', skip_if => 1)->render([['a',0],['b',1]]), '[a]',
+        '  a matching numeric skip still works';
+    is +Text::Stencil->new(row => '[{n}]', skip_if => 's')->render([{n=>'a',s=>0},{n=>'b',s=>1}]),
+        '[a]', '  and a matching named one';
+    ok eval { Text::Stencil->new(row => 'lit', skip_if => 0); 1 },
+        '  a template with no field references accepts either kind';
+    ok eval { Text::Stencil->new(row => '[{0}]', skip_if => 1)->clone(row => '[{1}]'); 1 },
+        '  and a same-mode clone still works';
+
+    # "nan" parses to NaN, which is neither < nor > anything, so it compared
+    # equal to every key and the comparator stopped being a weak ordering --
+    # garbage order, and an out-of-bounds read in glibc's qsort before 2.39.
+    my $ns = Text::Stencil->new(row => '{0},');
+    is $ns->render_sorted([map { [$_] } qw(9 NaN 2 7 NaN 4)], 0, { numeric => 1 }),
+        'NaN,NaN,2,4,7,9,', 'NaN sorts as the zero every other junk value becomes';
+    is $ns->render_sorted([map { [$_] } qw(nan 5 3 nan 1)], 0, { numeric => 1 }),
+        'nan,nan,1,3,5,', '  lowercase too';
+    is $ns->render_sorted([map { [$_] } qw(9 2 7 4)], 0, { numeric => 1 }),
+        '2,4,7,9,', '  and an ordinary numeric sort is unchanged';
+
+    # INT_MIN was rejected by the parser but accepted by skip_if and the sort
+    # spec, so the same index was valid in one place and not another
+    for my $v (-2147483648, -2147483647, 2147483647) {
+        ok eval { Text::Stencil->new(row => "{$v}"); 1 }, "template accepts $v";
+        ok eval { Text::Stencil->new(row => '{0}', skip_if => $v); 1 }, "  skip_if accepts $v";
+    }
+    for my $v (2147483648, -2147483649) {
+        ok !eval { Text::Stencil->new(row => "{$v}"); 1 }, "template rejects $v";
+        ok !eval { Text::Stencil->new(row => '{0}', skip_if => $v); 1 }, "  skip_if rejects $v";
+    }
+    is +Text::Stencil->new(row => '{-1}')->render_one([1,2,3]), '3',
+        '  ordinary negative indexing still works';
+
+    # one argument that is not a plain string is neither shorthand nor options
+    like exception_from(sub { Text::Stencil->new(undef) }),
+        qr/template string or an option list/,
+        'new(undef) names the actual mistake';
+    like exception_from(sub { Text::Stencil->new([]) }),
+        qr/template string or an option list/, '  and new([])';
+    is +Text::Stencil->new('{0}')->render_one([7]), '7', '  shorthand still works';
+    is +Text::Stencil->new(row => '{0}')->render_one([7]), '7', '  option list still works';
+}
+
+{   # mg_findext does not check the SV type, and only PVMG-or-richer has a magic
+    # chain, so on a smaller body it walked whatever the union held. sv_bless
+    # upgrades every blessed referent, which is why method calls are safe and
+    # twelve rounds missed this -- but the function-call form hands us an
+    # unblessed low-type referent and segfaulted once the heap was warm enough
+    # for the garbage to be non-NULL. A render first is what arms it.
+    my $warm = Text::Stencil->new(row => '{0}');
+    $warm->render([[1]]);
+    for my $bad (\undef, \'str', \42, \3.14, [], {}, sub {}, undef, 'str', 42) {
+        my $what = defined $bad ? (ref($bad) ? 'ref ' . (ref($bad) || 'SCALAR') : 'plain') : 'undef';
+        like exception_from(sub { Text::Stencil::render($bad, [[1]]) }),
+            qr/not a Text::Stencil object/,
+            "a non-object invocant ($what) croaks instead of crashing";
+    }
+    # DESTROY takes the same path and must survive it too
+    my $ok = eval { Text::Stencil::DESTROY(\'str'); 1 };
+    ok $ok, 'DESTROY on a non-object invocant does not crash';
+}
+
+{   # The strtod scratch was 64 bytes, which truncated a longer numeric to its
+    # first 63 digits -- not a precision nit but a wrong magnitude, and numeric
+    # sort then ordered a 70-digit value below a 64-digit one.
+    my $long = '1' x 70;
+    is +Text::Stencil->new(row => '{0:raw|float:0}')->render_one([$long]),
+       +Text::Stencil->new(row => '{0:float:0}')->render_one([$long]),
+        'a long numeric reads the same mid-chain as first-position';
+    my $s = Text::Stencil->new(row => '{0};');
+    is $s->render_sorted([['1' x 70], ['9' x 64]], 0, { numeric => 1 }),
+        ('9' x 64) . ';' . ('1' x 70) . ';',
+        '  and numeric sort orders by magnitude, not by truncated prefix';
+    # past DBL_MAX the answer is inf either way, which is correct
+    like +Text::Stencil->new(row => '{0:raw|float:0}')->render_one(['9' x 400]),
+        qr/^-?inf/i, '  a value past DBL_MAX is still infinite';
+}
+
+{   # wrap is the only transform that ADDS to slen in the accumulator, and that
+    # accumulator was an int while the guard above only caps slen at INT_MAX --
+    # so a prefix on a value near the cap overflowed to negative and the length
+    # became ~SIZE_MAX. Reproduced at 1/65536 scale (short accumulator, 32767
+    # guard): ASAN reported an allocation of 0xffffffffffff000e. No portable
+    # test can reach it at full scale, so this pins the ordinary shapes.
+    is +Text::Stencil->new(row => '{0:wrap:[:]}')->render_one(['mid']), '[mid]',
+        'wrap with both affixes';
+    is +Text::Stencil->new(row => '{0:wrap:PRE}')->render_one(['x']), 'PREx',
+        '  prefix only';
+    is +Text::Stencil->new(row => '{0:wrap:[:]}')->render_one(['']), '',
+        '  and an empty value emits nothing, not the wrapper';
+    my $big = 'x' x 100_000;
+    is length +Text::Stencil->new(row => '{0:wrap:AB:CD}')->render_one([$big]),
+        100_004, '  length is exact on a large value';
+
+    # count on an undef field is empty, so a later default must survive it. The
+    # use_default walk skipped render_field's count handler and apply_xform then
+    # wrote 0 over the default: {items:count|default:none} printed 0.
+    is +Text::Stencil->new(row => '{a:count|default:D}')->render_one({ a => undef }), 'D',
+        'count on an undef field lets a later default through';
+    is +Text::Stencil->new(row => '{a:count|default:D}')->render_one({}), 'D',
+        '  and on an absent one';
+    is +Text::Stencil->new(row => '{a:count|wrap:[:]}')->render_one({ a => undef }), '',
+        '  wrap sees nothing rather than a 0';
+    # the container cases must be untouched
+    is +Text::Stencil->new(row => '{a:count|default:D}')->render_one({ a => [1,2,3] }), '3',
+        '  a real container still counts';
+    is +Text::Stencil->new(row => '{a:count|default:D}')->render_one({ a => [] }), '0',
+        '  and an empty one still counts 0, not the default';
+    is +Text::Stencil->new(row => '{#:count}')->render([[1],[2]]), '00',
+        '  {#:count} still reports 0, the answer for a scalar';
+
+    # Dropping the count stage also changed what map sees on an undef field:
+    # it used to match 0= (count had written a 0), now it matches * like map
+    # alone does. That consistency is the point -- but an array that really is
+    # empty must still count 0 and match 0=.
+    is +Text::Stencil->new(row => '{a:count|map:0=zero:*=some}')->render_one({ a => undef }),
+       +Text::Stencil->new(row => '{a:map:0=zero:*=some}')->render_one({ a => undef }),
+        'count|map on undef agrees with map alone';
+    is +Text::Stencil->new(row => '{a:count|map:0=zero:*=some}')->render_one({ a => [] }), 'zero',
+        '  but a genuinely empty container still counts 0';
+    is +Text::Stencil->new(row => '{a:count|map:0=zero:*=some}')->render_one({ a => [1,2] }), 'some',
+        '  and a non-empty one still counts';
+}
+
+{   # render_sorted croaks on a swallowed extra argument; render_cb did not, so
+    # a stray third argument was silently ignored.
+    my $s = Text::Stencil->new(row => '{0}');
+    my $out = '';
+    open my $fh, '>', \$out or die;
+    like exception_from(sub { $s->render_cb(sub { undef }, $fh, 'EXTRA') }),
+        qr/render_cb takes at most two arguments/,
+        'render_cb rejects a swallowed extra argument';
+    # the two supported arities still work
+    my $n = 0;
+    is $s->render_cb(sub { $n < 2 ? [$n++] : undef }), '01', '  two-arg form still works';
+    $n = 0;
+    my $o2 = '';
+    open my $fh2, '>', \$o2 or die;
+    $s->render_cb(sub { $n < 2 ? [$n++] : undef }, $fh2);
+    close $fh2;
+    is $o2, '01', '  three-arg form still works';
+}
+
+{   # A hole in the rows array reads as undef and cannot be told from an
+    # assigned undef, but render/render_to_fh skipped it while still counting
+    # it, and render_sorted rendered it -- so the paths disagreed on identical
+    # input and row_count disagreed with the output it described.
+    my $s = Text::Stencil->new(row => '[{0}]', separator => ',');
+    my @hole; $hole[0] = [1]; $hole[2] = [2];
+    my @expl = ([1], undef, [2]);
+
+    for my $c ([hole => \@hole], ['explicit undef' => \@expl]) {
+        my ($what, $rows) = @$c;
+        is $s->render($rows), '[1],[],[2]', "render emits an empty row for a $what";
+        is $s->row_count, 3, "  and counts it ($what)";
+        my $out = '';
+        open my $fh, '>', \$out or die;
+        $s->render_to_fh($fh, $rows);
+        close $fh;
+        is $out, '[1],[],[2]', "  render_to_fh agrees ($what)";
+        is $s->render_sorted([@$rows], 0), '[],[1],[2]',
+            "  render_sorted agrees ($what)";
+    }
+
+    # sv_2mortal returns early for an immortal without registering it, so
+    # pinning an undef row left the refcount increment unmatched -- one leaked
+    # reference per undef row. Invisible until it wraps, hence a test.
+    SKIP: {
+        skip 'Devel::Peek not available', 1 unless eval { require Devel::Peek; 1 };
+        my $refcnt = sub {
+            open my $tmp, '+>', undef       or return;
+            open my $saved, '>&', \*STDERR  or return;
+            open STDERR, '>&', $tmp         or return;
+            Devel::Peek::Dump(\undef);
+            open STDERR, '>&', $saved;
+            seek $tmp, 0, 0;
+            my $d = do { local $/; <$tmp> };
+            return $d =~ /REFCNT = (\d+)\s*\n\s*FLAGS = \(READONLY,PROTECT\)/ ? $1 : undef;
+        };
+        my $before = $refcnt->();
+        skip 'could not read PL_sv_undef refcount', 1 unless defined $before;
+
+        my @sparse; $sparse[$_ * 2] = [$_] for 0 .. 499;
+        $s->render(\@sparse);
+        my $sink = '';
+        open my $nfh, '>', \$sink or die;
+        $s->render_to_fh($nfh, \@sparse);
+        close $nfh;
+        $s->render_sorted([@sparse], 0);
+        $s->render_one(undef) for 1 .. 100;
+
+        is $refcnt->() - $before, 0,
+            'an undef row does not leak a reference to PL_sv_undef';
+    }
+
+    # ...but an array that SHRINKS mid-render must stop, not emit a row per
+    # index that no longer exists. (The tied-FETCH case is covered above; this
+    # pins the boundary the hole handling has to leave alone.)
+    our @TS_SHRINK;
+    {   package TS_ShrinkRow;
+        sub TIEHASH  { bless {}, shift }
+        sub FETCH    { splice @main::TS_SHRINK, 1; 'x' }
+        sub STORE {} sub DELETE {} sub CLEAR {} sub EXISTS { 1 }
+        sub FIRSTKEY { } sub NEXTKEY { }
+    }
+    tie my %shrink, 'TS_ShrinkRow';
+    @TS_SHRINK = (\%shrink, { k => 'second' }, { k => 'third' });
+    my $sh = Text::Stencil->new(row => '[{k}]');
+    is $sh->render(\@TS_SHRINK), '[x]',
+        'a rows array truncated mid-render stops instead of emitting empty rows';
+}
+
+{   # The POD once claimed a character-string input plus well-formed output was
+    # enough for a character result. Both hold here and the result is bytes: a
+    # high byte from anything that arrived as bytes rules it out regardless.
+    # Pinned so the prose cannot drift back.
+    my $tpl = '[{0}]';
+    utf8::upgrade($tpl);
+    ok utf8::is_utf8($tpl), 'the template is a character string';
+    my $out = Text::Stencil->new(row => $tpl)->render([["\xc3\xa9"]]);
+    ok !utf8::is_utf8($out),
+        'a byte field with high bytes forces a byte result, well-formed or not';
+    is $out, "[\xc3\xa9]", '  and the bytes come back untouched';
+    ok utf8::valid(do { my $c = $out; utf8::decode($c); $c }),
+        '  (the output really was well-formed UTF-8, so the rule is not vacuous)';
+
+    # the flagged-wins case, for contrast: nothing arrived as high bytes
+    my $wide = Text::Stencil->new(row => $tpl)->render([["\x{263a}"]]);
+    ok utf8::is_utf8($wide), 'a wide field still yields a character string';
+}
+
+{   # A delimiter above 0x7F cut a decoded template inside a multi-byte
+    # character and every piece stayed flagged, so render() and columns()
+    # returned SvUTF8 strings whose bytes were not UTF-8 and uc() died.
+    # Upgraded below so U+00E9 is stored as c3 a9, as from_file produces; the
+    # delimiter is the continuation byte, which is what lands mid-character.
+    my $tpl = "caf\x{e9}0\x{e9} tail";
+    utf8::upgrade($tpl);
+    ok utf8::is_utf8($tpl), 'the probe template really is a character string';
+    like exception_from(sub { Text::Stencil->new(row => $tpl, escape_char => "\xa9") }),
+        qr/escape_char must be an ASCII byte/,
+        'a high-bit escape_char is refused for a decoded row template';
+
+    # the two shapes that must keep working
+    my $bytes = Text::Stencil->new(row => "x\xe90\xe9", escape_char => "\xe9");
+    is $bytes->render([['V']]), 'xV', '  a byte template still takes a high-bit delimiter';
+    my $ascii = Text::Stencil->new(row => "caf\x{e9} [0] \x{2014}", escape_char => '[');
+    is $ascii->render([['V']]), "caf\x{e9} V \x{2014}",
+        '  and a decoded template still takes an ASCII one';
+    ok utf8::valid($ascii->render([['V']])), '  whose output is well-formed';
+
+    # NUL fell through `esc_char ? esc_char : '{'` and silently meant '{'
+    like exception_from(sub { Text::Stencil->new(row => '{0}', escape_char => "\0") }),
+        qr/escape_char must not be NUL/, 'a NUL escape_char is refused, not ignored';
+}
+
+{   # from_file checked only the open, so a path that opens but cannot be read
+    # warned from inside the module and handed back an empty renderer. Which
+    # message comes back depends on whether open() on a directory succeeds --
+    # it does on Unix, not on Win32 -- so accept either.
+    like exception_from(sub { Text::Stencil->from_file(File::Spec->tmpdir) }),
+        qr/can't (?:read|open) /, 'from_file reports a directory rather than warning';
+
+    # a genuinely empty file reads as a defined "" and must still be accepted
+    my ($fh, $path) = File::Temp::tempfile(UNLINK => 1);
+    close $fh;
+    my $empty = eval { Text::Stencil->from_file($path) };
+    ok defined $empty, '  and an empty file is still a valid template';
+    is $empty->render([['x']]), '', '  that renders nothing';
+}
+
+{   # The literal default is what follows the final ':'. Finding it by walking
+    # forwards and keeping the last segment seen never visited the empty tail of
+    # `coalesce:FIELD:`, so it settled on FIELD and emitted that field's NAME --
+    # a slice of the template text -- as the default. The natural spelling of
+    # "fall back to FIELD, else nothing" printed the word instead of nothing.
+    is +Text::Stencil->new(row => '{name:coalesce:nick:}')
+        ->render_one({ name => '', nick => '' }), '',
+        'a trailing : is an empty default, not the fallback field name';
+    is +Text::Stencil->new(row => '{0:coalesce:1:}')->render_one(['', '']), '',
+        '  in array mode too';
+    is +Text::Stencil->new(row => '{0:coalesce:1:2:}')->render_one(['', '', '']), '',
+        '  and with several fallbacks';
+    # the fallback and the non-empty default must still work
+    is +Text::Stencil->new(row => '{name:coalesce:nick:}')
+        ->render_one({ name => '', nick => 'N' }), 'N',
+        '  a non-empty fallback still wins';
+    is +Text::Stencil->new(row => '{name:coalesce:nick:D}')
+        ->render_one({ name => '', nick => '' }), 'D',
+        '  and a spelled-out default is untouched';
+}
+
+{   # is_field_truthy already ran get-magic (both container branches do), then
+    # plain SvPV ran it a second time. A tied element's second FETCH can return
+    # something else, so the skip decision was taken on a value no other part of
+    # the render ever sees. fetch_field uses SvPV_nomg after the same
+    # SvGETMAGIC; this was the one site still spelled the magic-honouring way.
+    package TS_CountFetch;
+    sub TIESCALAR { my ($c, $vals) = @_; bless { v => $vals, n => 0 }, $c }
+    sub FETCH     { my $s = shift; $s->{n}++; $s->{v}[ $s->{n} - 1 ] // $s->{v}[-1] }
+    sub STORE     { }
+    sub count     { $_[0]{n} }
+
+    package main;
+    # first FETCH says "skip", a second would say "keep"
+    my @row = (undef, 'payload');
+    my $obj = tie $row[0], 'TS_CountFetch', [1, 0];
+    is +Text::Stencil->new(row => '{1}', skip_if => 0)->render([\@row]), '',
+        'skip_if acts on the first FETCH, not a second one';
+    is $obj->count, 1, '  and fetches a tied element exactly once';
+
+    my %h;
+    my $hobj = tie $h{flag}, 'TS_CountFetch', [1, 0];
+    is +Text::Stencil->new(row => '{x}', skip_if => 'flag')->render([\%h]), '',
+        '  same for a tied hash value';
+    is $hobj->count, 1, '  fetched once there too';
+}
+
+{   # Two documented details nothing asserted, both found by re-reading the POD
+    # against the build: coalesce selects on non-empty rather than on truth
+    # (the POD had said "truthy" in one place and "non-empty" in another), and
+    # columns() lists field references only, not the row number.
+    is +Text::Stencil->new(row => '{0:coalesce:1:D}')->render_one(['0', 'fb']), '0',
+        'coalesce keeps a "0" primary -- non-empty, not truthy';
+    is +Text::Stencil->new(row => '{0:coalesce:1:D}')->render_one(['', 'fb']), 'fb',
+        '  and still falls through an empty one';
+    is_deeply +Text::Stencil->new(row => '{#} {0} {2}')->columns, [0, 2],
+        'columns skips the row number';
+
+    # render_sorted was the one render path whose row_count nothing checked
+    my $rs = Text::Stencil->new(row => '{0};', skip_if => 1);
+    is $rs->render_sorted([['c', 0], ['a', 1], ['b', 0]], 0), 'b;c;',
+        'render_sorted skips as the other paths do';
+    is $rs->row_count, 3, '  and counts the rows in, skipped ones included';
+}
+
+{   # Existing tests used values holding SEVERAL special bytes at once, so
+    # clearing any single table entry left the others to keep the output
+    # looking right -- dropping backslash from json_special shipped invalid
+    # JSON with the suite green. Check every byte on its own instead.
+    my %ref = (
+        html => sub {
+            my $c = shift;
+            return '&amp;'  if $c eq '&';
+            return '&lt;'   if $c eq '<';
+            return '&gt;'   if $c eq '>';
+            return '&quot;' if $c eq '"';
+            return '&#39;'  if $c eq "'";
+            return $c;
+        },
+        html_br => sub {
+            my $c = shift;
+            return '<br>' if $c eq "\n";
+            return '&amp;'  if $c eq '&';
+            return '&lt;'   if $c eq '<';
+            return '&gt;'   if $c eq '>';
+            return '&quot;' if $c eq '"';
+            return '&#39;'  if $c eq "'";
+            return $c;
+        },
+        json => sub {
+            my $c = shift;
+            return '\\"'  if $c eq '"';
+            return '\\\\' if $c eq "\\";
+            return '\\b'  if $c eq "\x08";
+            return '\\f'  if $c eq "\x0c";
+            return '\\n'  if $c eq "\x0a";
+            return '\\r'  if $c eq "\x0d";
+            return '\\t'  if $c eq "\x09";
+            return sprintf '\\u%04x', ord $c if ord($c) < 0x20;
+            return $c;
+        },
+    );
+
+    for my $t (sort keys %ref) {
+        my $s = Text::Stencil->new(row => "{0:$t}");
+        my @bad;
+        for my $b (0 .. 255) {
+            my $c   = chr $b;
+            my $got = $s->render([[$c]]);
+            my $want = $ref{$t}->($c);
+            push @bad, sprintf('0x%02x got %s want %s', $b, _vis($got), _vis($want))
+                if $got ne $want;
+        }
+        is scalar @bad, 0, "$t escapes every byte 0x00-0xff on its own"
+            or diag join "\n", @bad[0 .. ($#bad > 7 ? 7 : $#bad)];
+    }
+
+    sub _vis { my $s = shift; $s =~ s/([^\x20-\x7e])/sprintf '\\x%02x', ord $1/ge; "[$s]" }
 }
 
 done_testing;

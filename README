@@ -62,11 +62,16 @@ CONSTRUCTOR
         → "]", "(" → ")", "<" → ">"; others use the same character for open
         and close. Useful for JSON templates where literal braces are needed.
 
-        It must be exactly one byte. Anything else is an error: a
-        two-character string, or a character that encodes to more than one
+        It must be exactly one byte, and not "NUL". Anything else is an error:
+        a two-character string, or a character that encodes to more than one
         byte, would match nothing - the whole template would then render
-        literally with no field ever substituted. A single byte above 0x7F is
-        fine.
+        literally with no field ever substituted.
+
+        A byte above 0x7F is accepted only when the row template is a byte
+        string. Against a character string it is an error, because the row is
+        split on raw bytes and a high delimiter would cut a multi-byte
+        character in half. Note that "from_file" always decodes, so a template
+        loaded from a file always needs an ASCII delimiter.
 
     "skip_if"
         Column index or field name. Rows where this field is truthy
@@ -135,7 +140,10 @@ METHODS
     Optional third argument is a hashref: "descending" sorts descending,
     "numeric" compares numerically. "descending" and a leading "-" select the
     same thing rather than cancelling: with either one present the sort
-    descends, so '-name' with "{descending => 0}" still descends. As with
+    descends, so '-name' with "{descending => 0}" still descends. A spec of
+    the wrong kind for the template - field names against "{0}", or column
+    indices against "{name}" - is an error rather than a sort that quietly
+    does nothing, since it could not have fetched a key from any row. As with
     "new", an unrecognised key in that hashref is an error - a misspelled
     "decending" would otherwise sort the wrong way with nothing to explain it.
 
@@ -163,7 +171,10 @@ METHODS
     The handle is resolved once, at the start. Closing or reopening it from
     code that runs during the render - a tied "FETCH", an overloaded "" -
     leaves the rest of the output going to whatever now occupies that slot, so
-    don't.
+    don't. Don't write to it either: the render's own output is buffered in
+    chunks, so anything you "print" to the same handle mid-render - or send
+    there with a nested "render_to_fh" - lands ahead of the output being
+    assembled around it, not where you wrote it.
 
   render_cb
         my $output = $s->render_cb(sub { return \@row_or_undef });
@@ -174,20 +185,22 @@ METHODS
     undef, a plain string, some other kind of reference - also stops it. If a
     filehandle is given, output is streamed to it; otherwise returns a string.
 
-    The callback must return normally. Do not leave it with "last" or "goto"
-    aimed at a label outside the sub: perl unwinds this call mid-flight, and
-    what happens next is not merely an undefined return value - the
-    interpreter can resume inside a block it has already left, run the
-    following statements twice, or crash. Perl does not support exiting a sub
-    that way from an XS callback and nothing here can make it safe. "die" is
-    the supported way to abort early; it propagates out of "render_cb"
-    unchanged. To stop without an error, return "undef".
+    Leaving the callback with "last", "next" or "goto" aimed at a label
+    outside the sub does not work, but it fails cleanly: the callback runs on
+    a call stack of its own, so the jump finds no such label and dies - Label
+    not found for "last LABEL", or "Can't find label LABEL" for "goto" - which
+    you can catch like any other error. (Before 0.03 it unwound this call
+    mid-flight and the interpreter could resume inside a block it had already
+    left, run the following statements twice, or crash.) "die" is the
+    supported way to abort early; it propagates out of "render_cb" unchanged.
+    To stop without an error, return "undef".
 
   columns
         my $cols = $s->columns;    # [0, 2] or ['name', 'id']
 
     Field references used in the row template, each listed once, in the order
-    it first appears.
+    it first appears. "{#}" is the row number rather than a field reference,
+    and is not listed.
 
   row_count
         $s->render(\@rows);
@@ -210,8 +223,11 @@ TEMPLATE SYNTAX
     "{#}" is the current row number (0-based). It numbers the rows you passed
     in, not the ones that come out, so with "skip_if"/"skip_unless" the
     numbers have gaps and need not start at 0 - the same rows "row_count"
-    counts. Works with chaining: "{#:int_comma}", "{#:pad:4}". In
-    "render_one", the row number is 0.
+    counts. Under "render_sorted" it is the position after sorting rather than
+    the position you passed the row in at, since sorting is what the row
+    number is usually wanted for; skipped rows still leave gaps. Works with
+    chaining: "{#:int_comma}", "{#:pad:4}". In "render_one", the row number is
+    0.
 
   Literal delimiters
     "{{" produces a literal "{" in output. Useful for JSON templates:
@@ -233,6 +249,14 @@ TEMPLATE SYNTAX
     instead take the digits and ignore everything else, so "1e3" is 13 to them
     and 1000 to "int". "plural" keeps a leading "-", the other three drop it.
     Junk formats as zero rather than failing.
+
+    The integer conversions then narrow the number the way C does, so a value
+    too large for an "IV" wraps exactly as Perl's own "sprintf "%d"" wraps it:
+    "1e19" and "1e30" give the same answers here as there. An infinite value
+    is the one place to be careful - Perl's %d prints the word "Inf", while
+    this hands the value to the platform's "IV" conversion, and what that
+    produces differs between perl versions. "NaN" is 0 everywhere, like other
+    junk.
 
     The Perl-numification half of that holds only where those four come first
     in a chain, which is where the original scalar is still there to numify.
@@ -315,14 +339,19 @@ TEMPLATE SYNTAX
         {0:trim|trunc:80|html}     # pipe transforms left to right
 
     "count" and "coalesce" act on the raw field value (a container's size, or
-    the first truthy field), so each must be the first transform in its chain.
-    Using either later in a chain is a compile-time error.
+    the first non-empty field), so each must be the first transform in its
+    chain. Using either later in a chain is a compile-time error.
 
     An unrecognised transform name is a compile-time error too, so a typo such
     as "{0:hmtl}" is reported rather than quietly passing the value through
     unescaped. Names are case-sensitive and are not trimmed, so "{0:HTML}" and
-    "{0: html}" are errors as well. A trailing ":" with nothing after it
-    ("{0:}") is not a transform at all and is simply ignored.
+    "{0: html}" are errors as well. A trailing delimiter with nothing after it
+    - "{0:}" or "{0:trim|}" - is not a transform at all and is simply ignored.
+    An empty segment anywhere else ("{0:|trim}", "{0:trim||}") is an error.
+
+    A parameter given to a transform that does not take one - "{0:uc:1}",
+    "{0:html:5}" - is a compile-time error for the same reason: it reads as
+    though it does something.
 
   Transform parameters
     Transforms taking a number ("float", "pad", "rpad", "trunc", "mask",
@@ -343,28 +372,37 @@ TEMPLATE SYNTAX
     rejected, in a template at compile time and in "skip_if", "skip_unless" or
     a "render_sorted" sort spec when the call is made.
 
-    A field value larger than 2GB is returned unchanged by every transform.
+    A field value larger than 2GB is returned unchanged by the string
+    transforms. The ones that read the scalar as a number rather than as text
+    - "int", "int_comma", "float", "count", and "sprintf" with any conversion
+    but %s - never look at the string, so they behave the same at any length.
 
 UNICODE
-    The output follows the input. If any template string or field value is a
-    character string, and the assembled output is well-formed UTF-8, the
-    result is a character string; otherwise it is a byte string. Rendering
-    only byte strings therefore round-trips Latin-1 and binary data unchanged.
+    The output follows the input. The result is a character string only if
+    something character-ish contributed and nothing ruled it out: a high byte
+    in a template piece or field value that arrived as bytes forces a byte
+    string, as does a transform that cuts a character in half. That holds even
+    where the assembled output happens to be well-formed UTF-8 - a character
+    template rendering the bytes "\xc3\xa9" gives those two bytes back
+    unflagged. Rendering only byte strings therefore round-trips Latin-1 and
+    binary data unchanged.
 
     Do not mix the two in one render: decode your inputs, or leave them all as
     bytes. Feeding already-encoded UTF-8 bytes alongside decoded characters is
     ambiguous, and whether the result comes back flagged then depends on the
-    order the values are seen in.
+    order the values are seen in - where a byte value carrying high bytes is
+    seen before anything character-ish, the decision is deferred and settled
+    by validating the whole output instead.
 
     A row that is not an arrayref or hashref renders every field empty rather
     than failing, and still counts towards "row_count".
 
-    All string operations are byte-level, so "length", "trunc", "substr",
-    "pad" and "mask" count bytes and can cut a multi-byte character in half;
-    the result is then returned as bytes rather than as a malformed character
-    string. "uc"/"lc" are ASCII-only. "json" escapes only what JSON requires
-    and passes bytes >= 0x80 through untouched, so encode the value first if
-    the consumer expects UTF-8.
+    All string operations are byte-level: "length" counts bytes and
+    "pad"/"rpad" pad to a byte width, while "trunc", "substr" and "mask" can
+    cut a multi-byte character in half; the result is then returned as bytes
+    rather than as a malformed character string. "uc"/"lc" are ASCII-only.
+    "json" escapes only what JSON requires and passes bytes >= 0x80 through
+    untouched, so encode the value first if the consumer expects UTF-8.
 
 THREAD SAFETY
     The object is not safe for concurrent renders from multiple threads due to
@@ -397,10 +435,10 @@ PERFORMANCE
 
     Transform throughput (1000 rows, single transform):
 
-        int        38.6K/s    default:x 33.5K/s    trunc:20  31.9K/s
-        int_comma  31.8K/s    uc        31.7K/s    raw       30.8K/s
-        json       28.5K/s    url       27.7K/s    html      19.7K/s
-        trim|html  17.7K/s    float:2    4.2K/s
+        int_comma  28.1K/s    int       27.8K/s    trunc:20  27.7K/s
+        uc         26.6K/s    default:x 25.3K/s    json      23.8K/s
+        raw        23.3K/s    url       22.6K/s    html      14.4K/s
+        trim|html  13.9K/s    float:2    4.2K/s
 
     Chain depth scaling (1000 rows), relative to a single "html":
 
@@ -411,14 +449,12 @@ PERFORMANCE
 
     Row count scaling (int + html escape per row):
 
-        ~15-22M rows/s; flat from 100 to 10000 rows, ~20% lower at 10 rows
+        ~11-17M rows/s; roughly flat from 100 to 10000 rows, ~20% lower at 10
         where the per-render setup is not amortised
 
     render vs render_one (single row):
 
-        render_one  5.8M/s  (~35-40% faster than render for single rows)
-
-    Run "perl -Mblib bench.pl" for your own numbers.
+        render_one  ~4-5M/s  (~40% faster than render for single rows)
 
 AUTHOR
     vividsnow

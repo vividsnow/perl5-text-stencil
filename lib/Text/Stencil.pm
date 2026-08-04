@@ -21,6 +21,12 @@ sub from_file {
         or die "Text::Stencil: can't open $file: $!";
     local $/;
     my $content = <$fh>;
+    # open can succeed on something that cannot be read -- a directory is the
+    # easy case -- and an unchecked read then built a silently empty renderer
+    # after warning from inside here. An empty file reads as a defined "", so
+    # this still accepts one.
+    defined $content
+        or die "Text::Stencil: can't read $file: $!";
     close $fh;
     # split on whichever section markers are present, in any order
     my @parts = split /^__(HEADER|ROW|FOOTER)__[^\S\n]*\n/m, $content;
@@ -120,11 +126,16 @@ C<[> E<rarr> C<]>, C<(> E<rarr> C<)>, C<< < >> E<rarr> C<< > >>; others use
 the same character for open and close. Useful for JSON templates where
 literal braces are needed.
 
-It must be exactly one byte. Anything else is an error: a two-character
-string, or a character that encodes to more than one byte, would match
-nothing - the whole template
-would then render literally with no field ever substituted. A single byte
-above 0x7F is fine.
+It must be exactly one byte, and not C<NUL>. Anything else is an error: a
+two-character string, or a character that encodes to more than one byte,
+would match nothing - the whole template would then render literally with no
+field ever substituted.
+
+A byte above 0x7F is accepted only when the row template is a byte string.
+Against a character string it is an error, because the row is split on raw
+bytes and a high delimiter would cut a multi-byte character in half. Note
+that C<from_file> always decodes, so a template loaded from a file always
+needs an ASCII delimiter.
 
 =item C<skip_if>
 
@@ -204,7 +215,10 @@ lexically ascending by default. Optional third argument is a hashref:
 C<descending> sorts descending, C<numeric> compares numerically.
 C<descending> and a leading C<-> select the same thing rather than cancelling:
 with either one present the sort descends, so C<< '-name' >> with
-C<< {descending => 0} >> still descends. As with C<new>, an unrecognised key
+C<< {descending => 0} >> still descends. A spec of the wrong kind for
+the template - field names against C<{0}>, or column indices against
+C<{name}> - is an error rather than a sort that quietly does nothing, since
+it could not have fetched a key from any row. As with C<new>, an unrecognised key
 in that hashref is an error - a misspelled C<decending> would otherwise sort
 the wrong way with nothing to explain it.
 
@@ -234,6 +248,10 @@ still check C<close>.
 The handle is resolved once, at the start. Closing or reopening it from code
 that runs during the render - a tied C<FETCH>, an overloaded C<""> - leaves
 the rest of the output going to whatever now occupies that slot, so don't.
+Don't write to it either: the render's own output is buffered in chunks, so
+anything you C<print> to the same handle mid-render - or send there with a
+nested C<render_to_fh> - lands B<ahead> of the output being assembled around
+it, not where you wrote it.
 
 =head2 render_cb
 
@@ -246,21 +264,23 @@ undef, a plain string, some other kind of reference - also stops it.
 If a filehandle is given, output is streamed to it; otherwise returns a
 string.
 
-The callback must return normally. B<Do not> leave it with C<last> or C<goto>
-aimed at a label outside the sub: perl unwinds this call mid-flight, and what
-happens next is not merely an undefined return value - the interpreter can
-resume inside a block it has already left, run the following statements twice,
-or crash. Perl does not support exiting a sub that way from an XS callback and
-nothing here can make it safe. C<die> is the supported way to abort early; it
-propagates out of C<render_cb> unchanged. To stop without an error, return
-C<undef>.
+Leaving the callback with C<last>, C<next> or C<goto> aimed at a label outside
+the sub does not work, but it fails cleanly: the callback runs on a call stack
+of its own, so the jump finds no such label and dies - C<Label not found for
+"last LABEL">, or C<Can't find label LABEL> for C<goto> - which you can catch
+like any other error. (Before 0.03 it
+unwound this call mid-flight and the interpreter could resume inside a block
+it had already left, run the following statements twice, or crash.) C<die> is
+the supported way to abort early; it propagates out of C<render_cb> unchanged.
+To stop without an error, return C<undef>.
 
 =head2 columns
 
     my $cols = $s->columns;    # [0, 2] or ['name', 'id']
 
 Field references used in the row template, each listed once, in the order
-it first appears.
+it first appears. C<{#}> is the row number rather than a field reference,
+and is not listed.
 
 =head2 row_count
 
@@ -285,8 +305,10 @@ reference (C<{}>) or an unclosed delimiter.
 
 C<{#}> is the current row number (0-based). It numbers the rows you passed
 in, not the ones that come out, so with C<skip_if>/C<skip_unless> the numbers
-have gaps and need not start at 0 - the same rows C<row_count> counts. Works
-with chaining:
+have gaps and need not start at 0 - the same rows C<row_count> counts. Under
+C<render_sorted> it is the position after sorting rather than the position
+you passed the row in at, since sorting is what the row number is usually
+wanted for; skipped rows still leave gaps. Works with chaining:
 C<{#:int_comma}>, C<{#:pad:4}>. In C<render_one>, the row number is 0.
 
 =head2 Literal delimiters
@@ -313,6 +335,14 @@ and C<sprintf> numify as Perl would; C<date>, C<elapsed>, C<ago> and
 C<plural> instead take the digits and ignore everything else, so C<"1e3">
 is 13 to them and 1000 to C<int>. C<plural> keeps a leading C<->, the other
 three drop it. Junk formats as zero rather than failing.
+
+The integer conversions then narrow the number the way C does, so a value too
+large for an C<IV> wraps exactly as Perl's own C<sprintf "%d"> wraps it:
+C<"1e19"> and C<"1e30"> give the same answers here as there. An B<infinite>
+value is the one place to be careful - Perl's C<%d> prints the word C<Inf>,
+while this hands the value to the platform's C<IV> conversion, and what that
+produces differs between perl versions. C<NaN> is 0 everywhere, like other
+junk.
 
 The Perl-numification half of that holds only where those four come B<first>
 in a chain, which is where the original scalar is still there to numify. Later
@@ -400,14 +430,20 @@ mantissa keeps growing rather than gaining a larger prefix.
     {0:trim|trunc:80|html}     # pipe transforms left to right
 
 C<count> and C<coalesce> act on the raw field value (a container's size, or
-the first truthy field), so each must be the first transform in its chain.
+the first non-empty field), so each must be the first transform in its chain.
 Using either later in a chain is a compile-time error.
 
 An unrecognised transform name is a compile-time error too, so a typo such
 as C<{0:hmtl}> is reported rather than quietly passing the value through
 unescaped. Names are case-sensitive and are not trimmed, so C<{0:HTML}> and
-C<< {0: html} >> are errors as well. A trailing C<:> with nothing after it
-(C<{0:}>) is not a transform at all and is simply ignored.
+C<< {0: html} >> are errors as well. A trailing delimiter with nothing after
+it - C<{0:}> or C<< {0:trim|} >> - is not a transform at all and is simply
+ignored. An empty segment anywhere else (C<< {0:|trim} >>, C<< {0:trim||} >>)
+is an error.
+
+A parameter given to a transform that does not take one - C<{0:uc:1}>,
+C<{0:html:5}> - is a compile-time error for the same reason: it reads as
+though it does something.
 
 =head2 Transform parameters
 
@@ -429,27 +465,36 @@ simply renders empty. They must still fit in a C C<int>: a larger one is
 rejected, in a template at compile time and in C<skip_if>, C<skip_unless>
 or a C<render_sorted> sort spec when the call is made.
 
-A field value larger than 2GB is returned unchanged by every transform.
+A field value larger than 2GB is returned unchanged by the string
+transforms. The ones that read the scalar as a number rather than as text -
+C<int>, C<int_comma>, C<float>, C<count>, and C<sprintf> with any conversion
+but C<%s> - never look at the string, so they behave the same at any length.
 
 =head1 UNICODE
 
-The output follows the input. If any template string or field value is a
-character string, and the assembled output is well-formed UTF-8, the result
-is a character string; otherwise it is a byte string. Rendering only byte
-strings therefore round-trips Latin-1 and binary data unchanged.
+The output follows the input. The result is a character string only if
+something character-ish contributed and nothing ruled it out: a high byte in
+a template piece or field value that arrived as B<bytes> forces a byte
+string, as does a transform that cuts a character in half. That holds even
+where the assembled output happens to be well-formed UTF-8 - a character
+template rendering the bytes C<"\xc3\xa9"> gives those two bytes back
+unflagged. Rendering only byte strings therefore round-trips Latin-1 and
+binary data unchanged.
 
 Do not mix the two in one render: decode your inputs, or leave them all as
 bytes. Feeding already-encoded UTF-8 bytes alongside decoded characters is
 ambiguous, and whether the result comes back flagged then depends on the
-order the values are seen in.
+order the values are seen in - where a byte value carrying high bytes is
+seen before anything character-ish, the decision is deferred and settled by
+validating the whole output instead.
 
 A row that is not an arrayref or hashref renders every field empty rather
 than failing, and still counts towards C<row_count>.
 
-All string operations are byte-level, so C<length>, C<trunc>, C<substr>,
-C<pad> and
-C<mask> count bytes and can cut a multi-byte character in half; the result
-is then returned as bytes rather than as a malformed character string.
+All string operations are byte-level: C<length> counts bytes and
+C<pad>/C<rpad> pad to a byte width, while C<trunc>, C<substr> and C<mask>
+can cut a multi-byte character in half; the result is then returned as
+bytes rather than as a malformed character string.
 C<uc>/C<lc> are ASCII-only. C<json> escapes only what JSON requires and
 passes bytes E<gt>= 0x80 through untouched, so encode the value first if
 the consumer expects UTF-8.
@@ -487,10 +532,10 @@ directly, which is most of the gap between the two.
 
 B<Transform throughput> (1000 rows, single transform):
 
-    int        38.6K/s    default:x 33.5K/s    trunc:20  31.9K/s
-    int_comma  31.8K/s    uc        31.7K/s    raw       30.8K/s
-    json       28.5K/s    url       27.7K/s    html      19.7K/s
-    trim|html  17.7K/s    float:2    4.2K/s
+    int_comma  28.1K/s    int       27.8K/s    trunc:20  27.7K/s
+    uc         26.6K/s    default:x 25.3K/s    json      23.8K/s
+    raw        23.3K/s    url       22.6K/s    html      14.4K/s
+    trim|html  13.9K/s    float:2    4.2K/s
 
 B<Chain depth scaling> (1000 rows), relative to a single C<html>:
 
@@ -501,14 +546,12 @@ B<Chain depth scaling> (1000 rows), relative to a single C<html>:
 
 B<Row count scaling> (int + html escape per row):
 
-    ~15-22M rows/s; flat from 100 to 10000 rows, ~20% lower at 10 rows
+    ~11-17M rows/s; roughly flat from 100 to 10000 rows, ~20% lower at 10
     where the per-render setup is not amortised
 
 B<render vs render_one> (single row):
 
-    render_one  5.8M/s  (~35-40% faster than render for single rows)
-
-Run C<perl -Mblib bench.pl> for your own numbers.
+    render_one  ~4-5M/s  (~40% faster than render for single rows)
 
 =head1 AUTHOR
 

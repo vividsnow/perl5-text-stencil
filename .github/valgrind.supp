@@ -1,0 +1,13 @@
+# Suppressions for the CI valgrind job. Only third-party frames belong here --
+# nothing from XS.xs. The job gates on valgrind's exit code, so an unsuppressed
+# error anywhere fails the build.
+
+# Cwd's XS abs_path() calls memcpy with overlapping source and destination.
+# It is reached from File::Temp, which t/regressions.t and t/generic.t use for
+# their from_file cases. Entirely inside core's Cwd.so.
+{
+   perl-Cwd-abs_path-memcpy-overlap
+   Memcheck:Overlap
+   fun:__memcpy_chk
+   fun:XS_Cwd_abs_path
+}

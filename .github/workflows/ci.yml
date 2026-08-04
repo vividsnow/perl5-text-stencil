@@ -88,12 +88,24 @@ jobs:
       - run: make
       - name: make test (valgrind)
         run: |
-          valgrind --leak-check=full --show-leak-kinds=definite --errors-for-leak-kinds=definite \
-            --log-file=/tmp/vg.log \
-            perl -Iblib/lib -Iblib/arch t/fortune.t
-          grep -E '(definitely lost|ERROR SUMMARY)' /tmp/vg.log
-          LOST=$(grep 'definitely lost' /tmp/vg.log | grep -oP '\d+(?= bytes)' | head -1)
-          [ "${LOST:-0}" -eq 0 ] && echo "OK: no definite leaks" || { echo "FAIL: $LOST bytes definitely lost"; exit 1; }
+          # Gate on valgrind's own exit code. Scraping the byte count out of the
+          # log did not work: valgrind prints thousands separators, so
+          # `grep -oP '\d+(?= bytes)'` turned "1,000 bytes" into "000", which
+          # the numeric test then passed. --errors-for-leak-kinds=definite
+          # already makes a definite leak an error, so --error-exitcode is all
+          # that is needed.
+          # t/fortune.t alone covered 9 of 740 assertions and none of the
+          # croak, compile-error or sorted paths, which is where every leak
+          # fixed in 0.02 and 0.03 lived.
+          for t in t/regressions.t t/generic.t t/edge_coverage.t t/fortune.t; do
+            echo "== $t"
+            valgrind --leak-check=full --show-leak-kinds=definite \
+              --errors-for-leak-kinds=definite --error-exitcode=99 \
+              --suppressions=.github/valgrind.supp \
+              --log-file=/tmp/vg.log \
+              perl -Iblib/lib -Iblib/arch "$t" || { cat /tmp/vg.log; exit 1; }
+            grep -E '(definitely lost|ERROR SUMMARY)' /tmp/vg.log
+          done
 
   freebsd:
     runs-on: ubuntu-latest
